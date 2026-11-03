@@ -29,6 +29,8 @@ export class AuthService {
   private get now() { return this.deps.now(); }
   private hmac(kind: string, value: string) { return hmacHex(this.deps.config.hashKey, `${kind}:${value}`); }
   private audit(event: AuditEvent) { return this.deps.store.audit(event, this.now); }
+  /** True while the production smoke-test stage is active and this email is not a designated test account. */
+  private outsideSmoke(email: string) { const allow = this.deps.config.smokeTestEmails; return !!allow && !allow.has(email.trim().toLowerCase()); }
   private async bestEffort(fn: () => Promise<unknown>) { try { await fn(); } catch { /* provider hygiene only; Hourvia state is authoritative */ } }
 
   /** Fixed-window limits, keyed by HMAC so raw emails and IPs are never stored. */
@@ -60,7 +62,7 @@ export class AuthService {
     if (!token || !isSessionTokenShape(token)) return null;
     const now = this.now;
     const session = await this.deps.store.resolveSession(sha256Hex(token), now);
-    if (!session) return null;
+    if (!session || this.outsideSmoke(session.member.email)) return null;
     if (now.getTime() - session.lastSeenAt.getTime() > 60_000) {
       await this.deps.store.touchSession(session.sessionId, now, new Date(now.getTime() + this.deps.config.idleTimeoutSeconds * 1000));
     }
@@ -82,6 +84,11 @@ export class AuthService {
       { name: 'login_email', key: email, max: 10, windowSeconds: 900 },
     ]);
     if (blocked) return blocked;
+    if (this.outsideSmoke(email)) {
+      // Denied before Supabase is contacted, so a real user's identity is never touched during smoke tests.
+      await this.audit({ eventType: 'login', outcome: 'denied', emailHmac, ipHmac, details: { reason: 'smoke_allowlist' } });
+      return fail(401, 'login_failed', messages.loginFailed);
+    }
 
     const providerSession = await this.deps.provider.signInWithPassword(email, parsed.data.password);
     if (!providerSession) {
@@ -124,9 +131,10 @@ export class AuthService {
       { name: 'recovery_request_email', key: email, max: 3, windowSeconds: 3600 },
     ]);
     if (blocked) return blocked;
-    let result: 'sent' | 'not_eligible' | 'delivery_not_authorized' | 'provider_error' = 'not_eligible';
+    let result: 'sent' | 'not_eligible' | 'smoke_allowlist' | 'delivery_not_authorized' | 'provider_error' = 'not_eligible';
     const member = await this.deps.store.findMemberByEmail(email);
-    if (member?.status === 'active' && member.authUserId) {
+    if (member?.status === 'active' && member.authUserId && this.outsideSmoke(email)) result = 'smoke_allowlist';
+    else if (member?.status === 'active' && member.authUserId) {
       if (!this.deps.config.emailDeliveryAuthorized || !this.deps.config.appOrigin) result = 'delivery_not_authorized';
       else {
         try { await this.deps.provider.sendRecovery(email, `${this.deps.config.appOrigin}/reset-password`); result = 'sent'; }
@@ -150,15 +158,19 @@ export class AuthService {
     ]);
     if (blocked) return blocked;
     const ipHmac = this.hmac('ip', meta.ip), emailHmac = email ? this.hmac('email', email) : null;
+    if (email && this.outsideSmoke(email)) {
+      await this.audit({ eventType: 'recovery_completed', outcome: 'denied', emailHmac, ipHmac, details: { reason: 'smoke_allowlist' } });
+      return fail(400, 'recovery_failed', messages.recoveryFailed);
+    }
     const verified = await this.deps.provider.verifyEmailOtp(email && 'code' in data ? { type: 'recovery', email, code: data.code } : { type: 'recovery', tokenHash: (data as { tokenHash: string }).tokenHash });
     if (!verified) {
       await this.audit({ eventType: 'recovery_completed', outcome: 'denied', emailHmac, ipHmac, details: { reason: 'verification' } });
       return fail(400, 'recovery_failed', messages.recoveryFailed);
     }
     const member = await this.deps.store.findMemberByAuthUserId(verified.userId);
-    if (member?.status !== 'active') {
+    if (member?.status !== 'active' || this.outsideSmoke(member.email)) {
       await this.bestEffort(() => this.deps.provider.revokeSession(verified.accessToken, 'global'));
-      await this.audit({ eventType: 'recovery_completed', outcome: 'denied', subjectMemberId: member?.id, emailHmac, ipHmac, details: { reason: member ? `member_${member.status}` : 'no_membership' } });
+      await this.audit({ eventType: 'recovery_completed', outcome: 'denied', subjectMemberId: member?.id, emailHmac, ipHmac, details: { reason: !member ? 'no_membership' : member.status !== 'active' ? `member_${member.status}` : 'smoke_allowlist' } });
       return fail(400, 'recovery_failed', messages.recoveryFailed);
     }
     try { await this.deps.provider.setPassword(verified.userId, data.password); }
@@ -186,7 +198,7 @@ export class AuthService {
     }
     const now = this.now;
     const member = await this.deps.store.findMemberByAuthUserId(verified.userId);
-    if (!member || member.status !== 'invited' || !(await this.deps.store.hasPendingInvitation(member.id, now))) {
+    if (!member || member.status !== 'invited' || this.outsideSmoke(member.email) || !(await this.deps.store.hasPendingInvitation(member.id, now))) {
       await this.bestEffort(() => this.deps.provider.revokeSession(verified.accessToken, 'global'));
       await this.audit({ eventType: 'invitation_accepted', outcome: 'denied', subjectMemberId: member?.id, ipHmac, details: { reason: member ? `member_${member.status}_or_expired` : 'no_invitation' } });
       return fail(400, 'invitation_failed', messages.inviteFailed);
@@ -230,6 +242,10 @@ export class AuthService {
     const blocked = await this.limited(meta.ip, [{ name: 'admin_invite', key: admin.id, max: 30, windowSeconds: 3600 }]);
     if (blocked) return blocked;
     const email = parsed.data.email.trim().toLowerCase();
+    if (this.outsideSmoke(email)) {
+      await this.audit({ eventType: 'invitation_created', outcome: 'denied', actorMemberId: admin.id, emailHmac: this.hmac('email', email), details: { reason: 'smoke_allowlist' } });
+      return fail(403, 'smoke_allowlist', 'During production smoke testing, only designated test accounts can be invited.');
+    }
     const existing = await this.deps.store.findMemberByEmail(email);
     if (existing && existing.status !== 'invited') return fail(409, 'member_exists', 'This email already belongs to a workspace member.');
     let userId: string;
@@ -254,6 +270,7 @@ export class AuthService {
     if (memberId === admin.id) return fail(409, 'self_disable', 'You cannot disable your own access.');
     const target = await this.deps.store.findMemberById(memberId);
     if (!target) return fail(404, 'not_found', 'Member not found.');
+    if (this.outsideSmoke(target.email)) return fail(403, 'smoke_allowlist', 'During production smoke testing, only designated test accounts can be changed.');
     const changed = await this.deps.store.disableMember(memberId, admin.id, this.now);
     const revoked = await this.deps.store.revokeMemberSessions(memberId, 'member_disabled', this.now);
     let providerBanned = false;
@@ -265,7 +282,9 @@ export class AuthService {
   async revokeMemberSessions(memberId: string, meta: RequestMeta): Promise<Outcome> {
     const admin = await this.admin(meta);
     if ('status' in admin) return admin;
-    if (!z.uuid().safeParse(memberId).success || !(await this.deps.store.findMemberById(memberId))) return fail(404, 'not_found', 'Member not found.');
+    const target = z.uuid().safeParse(memberId).success ? await this.deps.store.findMemberById(memberId) : null;
+    if (!target) return fail(404, 'not_found', 'Member not found.');
+    if (this.outsideSmoke(target.email)) return fail(403, 'smoke_allowlist', 'During production smoke testing, only designated test accounts can be changed.');
     const revoked = await this.deps.store.revokeMemberSessions(memberId, 'admin_revoked', this.now);
     await this.audit({ eventType: 'sessions_revoked', outcome: 'success', actorMemberId: admin.id, subjectMemberId: memberId, details: { sessions_revoked: revoked } });
     return ok({ sessionsRevoked: revoked });

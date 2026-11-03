@@ -3,10 +3,13 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { PGlite } from '@electric-sql/pglite';
 import { handleAuthRequest } from '../http';
+import { roleScopedSqlClient } from '../sql-role';
 import { PostgresAuthStore } from '../store-postgres';
 import { ProviderConflictError, type AuthConfig, type AuthDeps, type IdentityProvider, type OtpVerification, type SqlClient } from '../types';
 
-export const SCHEMA_SQL = readFileSync(fileURLToPath(new URL('../../../db/proposals/sprint-1.7-auth/001_create_auth_foundation.sql', import.meta.url)), 'utf8');
+const proposal = (name: string) => readFileSync(fileURLToPath(new URL(`../../../db/proposals/sprint-1.7-auth/${name}`, import.meta.url)), 'utf8');
+export const SCHEMA_SQL = proposal('001_create_auth_foundation.sql');
+export const ROLE_SQL = proposal('002_restricted_auth_runtime_role.sql');
 export const ORIGIN = 'https://hourvia.test';
 
 export function pgliteClient(pg: PGlite): SqlClient {
@@ -52,14 +55,17 @@ export class FakeSupabase implements IdentityProvider {
   tokenFor(email: string, map: Map<string, string>) { return [...map].find(([, e]) => e === email)?.[0]; }
 }
 
-export async function createHarness(options: { schema?: boolean; config?: Partial<AuthConfig> } = {}) {
+export async function createHarness(options: { schema?: boolean; restrictedRole?: boolean; config?: Partial<AuthConfig> } = {}) {
   const pg = new PGlite();
   if (options.schema !== false) await pg.exec(SCHEMA_SQL);
-  const sql = pgliteClient(pg);
+  if (options.schema !== false && options.restrictedRole !== false) await pg.exec(ROLE_SQL);
+  // Like production: every store statement runs under SET LOCAL ROLE hourvia_auth_runtime. Seeding via `pg` runs
+  // as the owner, like the reviewed bootstrap.
+  const sql = roleScopedSqlClient(pgliteClient(pg));
   const provider = new FakeSupabase();
   const clock = { now: new Date('2026-11-03T10:00:00Z') };
   const sleeps: number[] = [];
-  const config: AuthConfig = { hashKey: 'k'.repeat(48), appOrigin: ORIGIN, emailDeliveryAuthorized: true, idleTimeoutSeconds: 1800, absoluteTimeoutSeconds: 43200, invitationTtlSeconds: 7 * 86400, recoveryMinimumMs: 750, ...options.config };
+  const config: AuthConfig = { hashKey: 'k'.repeat(48), appOrigin: ORIGIN, emailDeliveryAuthorized: true, idleTimeoutSeconds: 1800, absoluteTimeoutSeconds: 43200, invitationTtlSeconds: 7 * 86400, recoveryMinimumMs: 750, smokeTestEmails: null, ...options.config };
   const deps: AuthDeps = { store: new PostgresAuthStore(sql), provider, config, now: () => new Date(clock.now), sleep: async ms => { sleeps.push(ms); } };
   const advance = (seconds: number) => { clock.now = new Date(clock.now.getTime() + seconds * 1000); };
 

@@ -74,6 +74,12 @@ export interface AuthConfig {
   hashKey: string;
   appOrigin: string | null;
   emailDeliveryAuthorized: boolean;
+  /**
+   * Production smoke-test stage: when set, only these (lower-cased) designated test emails can sign in, be
+   * invited, recover a password, hold a session, or be administered. Everyone else is denied before any
+   * provider call, so real Supabase users are never touched. null = general availability.
+   */
+  smokeTestEmails: ReadonlySet<string> | null;
   idleTimeoutSeconds: number;
   absoluteTimeoutSeconds: number;
   invitationTtlSeconds: number;
