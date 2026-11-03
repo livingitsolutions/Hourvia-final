@@ -199,6 +199,8 @@ RLS gives no protection: there are no policies, and this role bypasses RLS anywa
 
 ## Migration promotion checklist (Gate 2)
 
+> **Superseded (Sprint 1.7 readiness, 2026-11-03):** use [migration-promotion-checklist.md](migration-promotion-checklist.md). The revised `002` fixes a failure under the non-superuser `netlifydb_owner` and removes `netlifydb_readonly` access to all auth tables. The P5 membership query below now returns two rows.
+
 - [ ] **P1.** Security and database owners have reviewed `001` and `002` and accepted risks F1–F6.
 - [ ] **P2.** Create a branch (not `main`) with exactly two new files and nothing else:
   - `netlify/database/migrations/<YYYYMMDDHHMMSS>_create-auth-foundation.sql`, a byte-for-byte copy of `001`

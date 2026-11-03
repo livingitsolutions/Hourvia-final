@@ -190,7 +190,7 @@ describe('disabled members and revocation', () => {
   it('denies a disabled member immediately even before session revocation', async () => {
     const c = await h.seedMember('c@t.test', 'contractor');
     const { cookie } = await h.login(c.email);
-    await h.pg.query(`UPDATE workspace_members SET status = 'disabled' WHERE id = $1`, [c.id]);
+    await h.pg.query(`UPDATE workspace_members SET status = 'disabled', disabled_at = now() WHERE id = $1`, [c.id]);
     expect((await h.call('GET', '/api/auth/session', { cookie })).status).toBe(401);
   });
   it('prevents admins from disabling themselves and validates member IDs', async () => {
@@ -249,7 +249,7 @@ describe('password recovery', () => {
   it('does not let a disabled member complete a reset with a still-valid code', async () => {
     const c = await h.seedMember('c@t.test', 'contractor');
     await h.call('POST', '/api/auth/recovery/request', { body: { email: c.email } });
-    await h.pg.query(`UPDATE workspace_members SET status = 'disabled' WHERE id = $1`, [c.id]);
+    await h.pg.query(`UPDATE workspace_members SET status = 'disabled', disabled_at = now() WHERE id = $1`, [c.id]);
     expect((await h.call('POST', '/api/auth/recovery/complete', { body: { email: c.email, code: '482913', password: 'my new long passphrase' } })).status).toBe(400);
     expect(h.provider.users.get(c.email)!.password).toBe('correct horse battery');
   });
