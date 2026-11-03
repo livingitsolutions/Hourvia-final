@@ -12,6 +12,34 @@ export const SCHEMA_SQL = proposal('001_create_auth_foundation.sql');
 export const ROLE_SQL = proposal('002_restricted_auth_runtime_role.sql');
 export const ORIGIN = 'https://hourvia.test';
 
+/**
+ * Emulation of the Netlify Database role catalog, reproduced from read-only pg_roles / pg_auth_members /
+ * pg_default_acl / pg_database queries on this project's database branch (PostgreSQL 18.6, 2026-11-03).
+ * PGlite's bootstrap superuser stands in for cloud_admin. Migrations and owner-side seeding run as the
+ * NON-superuser netlifydb_owner, so a statement that only works for a superuser fails here too.
+ * Not proven identical to Neon (which may patch role checks) — the promotion preview deploy is the real test.
+ */
+export const PLATFORM_ROLES_SQL = `
+  CREATE ROLE neon_superuser NOLOGIN CREATEROLE CREATEDB BYPASSRLS;
+  CREATE ROLE netlifydb_owner LOGIN CREATEROLE CREATEDB BYPASSRLS;
+  CREATE ROLE netlifydb_readonly LOGIN;
+  GRANT neon_superuser TO netlifydb_owner;
+  GRANT pg_read_all_data, pg_write_all_data, pg_monitor, pg_signal_backend TO neon_superuser WITH ADMIN OPTION;
+  GRANT netlifydb_readonly TO netlifydb_owner WITH ADMIN OPTION, INHERIT FALSE, SET FALSE;
+  DO $$ BEGIN EXECUTE format('ALTER DATABASE %I OWNER TO netlifydb_owner', current_database()); END $$;
+  GRANT USAGE ON SCHEMA public TO netlifydb_readonly;
+  ALTER DEFAULT PRIVILEGES FOR ROLE netlifydb_owner IN SCHEMA public GRANT SELECT ON TABLES TO netlifydb_readonly;
+`;
+
+/** Creates the platform roles, then switches the whole connection to netlifydb_owner (not a superuser). */
+export async function asNetlifyOwner(pg: PGlite) {
+  await pg.exec(PLATFORM_ROLES_SQL);
+  await pg.exec('SET SESSION AUTHORIZATION netlifydb_owner');
+}
+
+/** Applies one migration file the way Netlify's migration tooling does: one transaction per file. */
+export const applyMigration = (pg: PGlite, sql: string) => pg.transaction(async tx => { await tx.exec(sql); });
+
 export function pgliteClient(pg: PGlite): SqlClient {
   return {
     query: async <T>(text: string, params?: unknown[]) => ({ rows: (await pg.query<T>(text, params)).rows }),
@@ -57,10 +85,11 @@ export class FakeSupabase implements IdentityProvider {
 
 export async function createHarness(options: { schema?: boolean; restrictedRole?: boolean; config?: Partial<AuthConfig> } = {}) {
   const pg = new PGlite();
-  if (options.schema !== false) await pg.exec(SCHEMA_SQL);
-  if (options.schema !== false && options.restrictedRole !== false) await pg.exec(ROLE_SQL);
+  await asNetlifyOwner(pg);
+  if (options.schema !== false) await applyMigration(pg, SCHEMA_SQL);
+  if (options.schema !== false && options.restrictedRole !== false) await applyMigration(pg, ROLE_SQL);
   // Like production: every store statement runs under SET LOCAL ROLE hourvia_auth_runtime. Seeding via `pg` runs
-  // as the owner, like the reviewed bootstrap.
+  // as netlifydb_owner (non-superuser), like the reviewed bootstrap.
   const sql = roleScopedSqlClient(pgliteClient(pg));
   const provider = new FakeSupabase();
   const clock = { now: new Date('2026-11-03T10:00:00Z') };
@@ -81,7 +110,9 @@ export async function createHarness(options: { schema?: boolean; restrictedRole?
   /** Reviewed-bootstrap equivalent: an active admin linked to a Supabase identity. */
   async function seedMember(email: string, role: 'workspace_admin' | 'workspace_manager' | 'contractor', password = 'correct horse battery', extra: { approval?: boolean; status?: string } = {}) {
     const authUserId = provider.addUser(email, password);
-    const { rows } = await pg.query<{ id: string }>(`INSERT INTO workspace_members (workspace_id, auth_user_id, email, display_name, role, status, approval_authorized) VALUES ('thrivesource', $1, $2, $3, $4, $5, $6) RETURNING id`, [authUserId, email, email.split('@')[0], role, extra.status ?? 'active', extra.approval ?? false]);
+    const { rows } = await pg.query<{ id: string }>(`INSERT INTO workspace_members (workspace_id, auth_user_id, email, display_name, role, status, approval_authorized, activated_at, disabled_at)
+       VALUES ('thrivesource', $1, $2, $3, $4, $5, $6, CASE WHEN $5 <> 'invited' THEN now() END, CASE WHEN $5 = 'disabled' THEN now() END) RETURNING id`,
+      [authUserId, email, email.split('@')[0], role, extra.status ?? 'active', extra.approval ?? false]);
     return { id: rows[0]!.id, email, password, authUserId };
   }
   async function login(email: string, password = 'correct horse battery', ip?: string) { return call('POST', '/api/auth/login', { body: { email, password }, ip }); }
