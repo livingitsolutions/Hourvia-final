@@ -7,22 +7,26 @@ import { roleScopedSqlClient } from '../sql-role';
 import { PostgresAuthStore } from '../store-postgres';
 import { ProviderConflictError, type AuthConfig, type AuthDeps, type IdentityProvider, type OtpVerification, type SqlClient } from '../types';
 
-const proposal = (name: string) => readFileSync(fileURLToPath(new URL(`../../../db/proposals/sprint-1.7-auth/${name}`, import.meta.url)), 'utf8');
-export const SCHEMA_SQL = proposal('001_create_auth_foundation.sql');
-export const ROLE_SQL = proposal('002_restricted_auth_runtime_role.sql');
+// Sprint 1.8: tests run the promoted migration files, i.e. exactly what the Netlify migration runner applies.
+// migration-readiness.test.ts asserts they stay byte-identical to the reviewed proposals.
+const migration = (name: string) => readFileSync(fileURLToPath(new URL(`../../../netlify/database/migrations/${name}`, import.meta.url)), 'utf8');
+export const SCHEMA_SQL = migration('20261103170000_create-auth-foundation.sql');
+export const ROLE_SQL = migration('20261103170100_restrict-auth-runtime-role.sql');
 export const ORIGIN = 'https://hourvia.test';
 
 /**
  * Emulation of the Netlify Database role catalog, reproduced from read-only pg_roles / pg_auth_members /
- * pg_default_acl / pg_database queries on this project's database branch (PostgreSQL 18.6, 2026-11-03).
+ * pg_default_acl / pg_database queries on this project's database branch (PostgreSQL 18.6, 2026-11-03;
+ * re-checked in Sprint 1.8: netlifydb_owner also has REPLICATION, and a NOLOGIN token_roles role exists).
  * PGlite's bootstrap superuser stands in for cloud_admin. Migrations and owner-side seeding run as the
  * NON-superuser netlifydb_owner, so a statement that only works for a superuser fails here too.
  * Not proven identical to Neon (which may patch role checks) — the promotion preview deploy is the real test.
  */
 export const PLATFORM_ROLES_SQL = `
   CREATE ROLE neon_superuser NOLOGIN CREATEROLE CREATEDB BYPASSRLS;
-  CREATE ROLE netlifydb_owner LOGIN CREATEROLE CREATEDB BYPASSRLS;
+  CREATE ROLE netlifydb_owner LOGIN CREATEROLE CREATEDB REPLICATION BYPASSRLS;
   CREATE ROLE netlifydb_readonly LOGIN;
+  CREATE ROLE token_roles NOLOGIN;
   GRANT neon_superuser TO netlifydb_owner;
   GRANT pg_read_all_data, pg_write_all_data, pg_monitor, pg_signal_backend TO neon_superuser WITH ADMIN OPTION;
   GRANT netlifydb_readonly TO netlifydb_owner WITH ADMIN OPTION, INHERIT FALSE, SET FALSE;

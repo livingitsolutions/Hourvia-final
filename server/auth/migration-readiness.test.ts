@@ -1,7 +1,8 @@
 // MIGRATION READINESS TESTS (Sprint 1.7). Disposable embedded PostgreSQL 18 (PGlite) only — no Netlify Database.
 // The staged SQL is applied as a NON-superuser netlifydb_owner inside an emulation of the Netlify Database role
 // catalog (see PLATFORM_ROLES_SQL), one transaction per file, the way Netlify's migration tooling applies it.
-import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { PGlite } from '@electric-sql/pglite';
 import { describe, expect, it } from 'vitest';
@@ -21,6 +22,27 @@ async function migrated() {
 }
 const one = async <T>(pg: PGlite, text: string, params?: unknown[]) => (await pg.query<T>(text, params)).rows[0]!;
 
+// Sprint 1.8 promotion integrity: the deployed migrations are exactly the two security-reviewed proposals.
+describe('promoted migrations match the reviewed Sprint 1.7 proposals', () => {
+  const bytes = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)));
+  const sha256 = (b: Buffer) => createHash('sha256').update(b).digest('hex');
+  const PROMOTED = [
+    { file: '20261103170000_create-auth-foundation.sql', proposal: '001_create_auth_foundation.sql', sha: 'fa614b04e8caf8faf4ee82ff211c5fb78c2853f16cba765775919452bd39fe2a' },
+    { file: '20261103170100_restrict-auth-runtime-role.sql', proposal: '002_restricted_auth_runtime_role.sql', sha: '58be1ffd2ca6bc247ebbee88662aa3035d1a183492746004a4de413f7525f037' },
+  ];
+  it('contains exactly the two migrations, in lexicographic (execution) order', () => {
+    const dir = fileURLToPath(new URL('../../netlify/database/migrations/', import.meta.url));
+    expect(readdirSync(dir).sort()).toEqual(PROMOTED.map(m => m.file));
+  });
+  it('is byte-for-byte identical to the proposals and keeps the approved SHA-256', () => {
+    for (const m of PROMOTED) {
+      const promoted = bytes(`../../netlify/database/migrations/${m.file}`);
+      expect(sha256(promoted)).toBe(m.sha);
+      expect(promoted.equals(bytes(`../../db/proposals/sprint-1.7-auth/${m.proposal}`))).toBe(true);
+    }
+  });
+});
+
 describe('migration ordering and the real (non-superuser) migration role', () => {
   it('applies 001 then 002 as netlifydb_owner, which is not a superuser', async () => {
     const pg = new PGlite();
@@ -37,10 +59,13 @@ describe('migration ordering and the real (non-superuser) migration role', () =>
     await expect(applyMigration(pg, ROLE_SQL)).rejects.toThrow(/does not exist/);
     expect(await one(pg, `SELECT count(*)::int AS n FROM pg_roles WHERE rolname = 'hourvia_auth_runtime'`)).toEqual({ n: 0 }); // rolled back
   });
-  it('documents why the previous 002 was blocked: a non-superuser cannot name SUPERUSER/REPLICATION/BYPASSRLS', async () => {
+  it('documents why the previous 002 was blocked: the non-superuser migration role cannot name SUPERUSER', async () => {
     const pg = await migrated();
     await expect(pg.exec(`ALTER ROLE hourvia_auth_runtime NOSUPERUSER`)).rejects.toThrow(/permission denied/);
-    await expect(pg.exec(`ALTER ROLE hourvia_auth_runtime NOREPLICATION`)).rejects.toThrow(/permission denied/);
+    // Sprint 1.8 live catalog: netlifydb_owner holds REPLICATION, so PostgreSQL allows it to name (NO)REPLICATION.
+    // The promoted 002 never alters the role; it only verifies attributes and aborts on any elevated one.
+    expect(await one(pg, `SELECT rolreplication FROM pg_roles WHERE rolname = 'netlifydb_owner'`)).toEqual({ rolreplication: true });
+    expect(ROLE_SQL).not.toMatch(/^\s*ALTER\s+ROLE/im);
   });
   it('creates the runtime role with safe attributes, no memberships, and a SET-only grant to netlifydb_owner', async () => {
     const pg = await migrated();
@@ -125,8 +150,7 @@ describe('netlifydb_readonly cannot reach sensitive auth data (effective privile
   it('self-check aborts the migration if any other role (e.g. token_roles) holds a table or column grant', async () => {
     for (const grant of ['GRANT SELECT ON auth_sessions TO token_roles', 'GRANT SELECT (token_hash) ON auth_sessions TO token_roles']) {
       const pg = new PGlite();
-      await asNetlifyOwner(pg);
-      await pg.exec(`RESET SESSION AUTHORIZATION; CREATE ROLE token_roles NOLOGIN; SET SESSION AUTHORIZATION netlifydb_owner`);
+      await asNetlifyOwner(pg); // the platform emulation includes token_roles, as on the live catalog
       await applyMigration(pg, SCHEMA_SQL);
       await pg.exec(grant);
       await expect(applyMigration(pg, ROLE_SQL)).rejects.toThrow(/unexpected role/);
