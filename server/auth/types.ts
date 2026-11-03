@@ -1,0 +1,90 @@
+import type { Role } from '../../src/domain/permissions';
+
+/** Minimal SQL surface shared by Netlify Database (pg Pool) and the embedded test Postgres. */
+export interface SqlClient {
+  query<T = Record<string, unknown>>(text: string, params?: unknown[]): Promise<{ rows: T[] }>;
+  transaction<T>(fn: (tx: SqlClient) => Promise<T>): Promise<T>;
+}
+
+export type MemberStatus = 'invited' | 'active' | 'disabled';
+export interface MemberRecord {
+  id: string;
+  workspaceId: string;
+  authUserId: string | null;
+  email: string;
+  displayName: string;
+  role: Role;
+  status: MemberStatus;
+  approvalAuthorized: boolean;
+  createdAt: Date;
+}
+
+export interface SessionRecord { sessionId: string; member: MemberRecord; lastSeenAt: Date; absoluteExpiresAt: Date }
+
+export interface AuditEvent {
+  eventType: string;
+  outcome: 'success' | 'denied' | 'error';
+  actorMemberId?: string | null;
+  subjectMemberId?: string | null;
+  emailHmac?: string | null;
+  ipHmac?: string | null;
+  details?: Record<string, string | number | boolean | null>;
+}
+
+export interface AuthStore {
+  findMemberById(id: string): Promise<MemberRecord | null>;
+  findMemberByEmail(email: string): Promise<MemberRecord | null>;
+  findMemberByAuthUserId(authUserId: string): Promise<MemberRecord | null>;
+  listMembers(): Promise<MemberRecord[]>;
+  assignedContractorIds(managerMemberId: string): Promise<string[]>;
+  upsertInvitation(input: { email: string; role: Role; displayName: string; authUserId: string; invitedBy: string | null; now: Date; expiresAt: Date }): Promise<MemberRecord>;
+  hasPendingInvitation(memberId: string, now: Date): Promise<boolean>;
+  acceptInvitation(memberId: string, now: Date): Promise<boolean>;
+  disableMember(memberId: string, disabledBy: string, now: Date): Promise<boolean>;
+  createSession(input: { tokenHash: string; memberId: string; now: Date; idleExpiresAt: Date; absoluteExpiresAt: Date }): Promise<void>;
+  resolveSession(tokenHash: string, now: Date): Promise<SessionRecord | null>;
+  touchSession(sessionId: string, now: Date, idleExpiresAt: Date): Promise<void>;
+  revokeSession(tokenHash: string, reason: string, now: Date): Promise<string | null>;
+  revokeMemberSessions(memberId: string, reason: string, now: Date): Promise<number>;
+  hitRateLimit(bucket: string, windowStart: Date): Promise<number>;
+  audit(event: AuditEvent, now: Date): Promise<void>;
+}
+
+export interface ProviderSession { userId: string; accessToken: string }
+export type OtpVerification =
+  | { type: 'invite'; tokenHash: string }
+  | { type: 'recovery'; tokenHash: string }
+  | { type: 'recovery'; email: string; code: string };
+
+/** Credential verifier. Only ever runs inside Netlify Functions; no token leaves the server. */
+export interface IdentityProvider {
+  /** Resolves null for any credential rejection; throws only for provider outages. */
+  signInWithPassword(email: string, password: string): Promise<ProviderSession | null>;
+  verifyEmailOtp(params: OtpVerification): Promise<ProviderSession | null>;
+  revokeSession(accessToken: string, scope: 'local' | 'global'): Promise<void>;
+  inviteUser(email: string, redirectTo: string): Promise<{ userId: string }>;
+  sendRecovery(email: string, redirectTo: string): Promise<void>;
+  setPassword(userId: string, password: string): Promise<void>;
+  banUser(userId: string): Promise<void>;
+}
+
+export class ProviderConflictError extends Error {}
+
+export interface AuthConfig {
+  hashKey: string;
+  appOrigin: string | null;
+  emailDeliveryAuthorized: boolean;
+  idleTimeoutSeconds: number;
+  absoluteTimeoutSeconds: number;
+  invitationTtlSeconds: number;
+  /** Minimum duration of recovery requests, to blunt timing-based account enumeration. */
+  recoveryMinimumMs: number;
+}
+
+export interface AuthDeps {
+  store: AuthStore;
+  provider: IdentityProvider;
+  config: AuthConfig;
+  now(): Date;
+  sleep(ms: number): Promise<void>;
+}

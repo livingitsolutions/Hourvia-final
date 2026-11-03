@@ -7,3 +7,13 @@
   from = "/*"
   to = "/index.html"
   status = 200
+
+# Sprint 1.7: baseline security headers. Auth API responses also set Cache-Control: no-store themselves.
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "DENY"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "no-referrer"
+    Permissions-Policy = "camera=(), microphone=(), geolocation=()"
+    Content-Security-Policy = "frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'"

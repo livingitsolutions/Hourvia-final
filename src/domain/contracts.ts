@@ -3,6 +3,22 @@ import type { Principal, ResourceScope } from './permissions';
 export const loginSchema = z.object({ email: z.email('Enter a valid work email address.'), password: z.string().min(1, 'Enter your password.') });
 export type LoginInput = z.infer<typeof loginSchema>;
 export interface Authentication { getSession(): Promise<Principal | null>; signIn(input: LoginInput): Promise<Principal>; signOut(): Promise<void> }
+// Sprint 1.7 additive contracts: invitation acceptance and recovery. Shared by browser forms and server validation.
+export const passwordSchema = z.string().min(12, 'Use at least 12 characters.').max(72, 'Use 72 characters or fewer.').refine(value => value.trim().length >= 12, 'Use at least 12 non-space characters.');
+const tokenHashSchema = z.string().regex(/^[A-Za-z0-9_-]{16,256}$/, 'This link is incomplete. Open it again from your email.');
+export const recoveryCodeSchema = z.string().regex(/^\d{6}$/, 'Enter the 6-digit code from your email.');
+export const recoveryRequestSchema = z.object({ email: z.email('Enter a valid work email address.') });
+export const recoveryCompleteSchema = z.union([
+  z.strictObject({ email: z.email('Enter a valid work email address.'), code: recoveryCodeSchema, password: passwordSchema }),
+  z.strictObject({ tokenHash: tokenHashSchema, password: passwordSchema }),
+]);
+export type RecoveryCompleteInput = z.infer<typeof recoveryCompleteSchema>;
+export const acceptInvitationSchema = z.object({ tokenHash: tokenHashSchema, password: passwordSchema });
+export type AcceptInvitationInput = z.infer<typeof acceptInvitationSchema>;
+/** Admins may invite only Managers and Contractors. Workspace is fixed server-side and never accepted here. */
+export const adminInviteSchema = z.object({ email: z.email('Enter a valid work email address.').max(320), role: z.enum(['workspace_manager', 'contractor']), displayName: z.string().trim().max(120).optional() });
+export type AdminInviteInput = z.infer<typeof adminInviteSchema>;
+export interface AccountAccess { requestRecovery(email: string): Promise<string>; completeRecovery(input: RecoveryCompleteInput): Promise<string>; acceptInvitation(input: AcceptInvitationInput): Promise<string> }
 export const taskSchema = z.enum(['Working', 'Break', 'Lunch']);
 export const shiftStartSchema = z.object({ projectId: z.string().trim().min(1), description: z.string().trim().min(1) });
 export type UtcTimestamp = string; // ISO 8601 UTC (Z); validate at the future API boundary.
