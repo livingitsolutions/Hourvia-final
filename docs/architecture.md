@@ -9,7 +9,7 @@ Hourvia by Living IT Solutions serves the single ThriveSource workspace. The int
 - `src/domain`: authentication, authorization, shifts, timesheets, approvals, and cutoff interfaces; Zod input schemas; centralized permission policy. No framework or database dependency.
 - `src/infrastructure`: deliberately unconfigured authentication adapter. Session resolution returns null; sign-in always fails. There are no hardcoded credentials, browser storage sessions, network credential submissions, or role switches.
 
-`AuthProvider` accepts an Authentication implementation. The production entry point only supplies `unconfiguredAuth`. Test-only service implementations exercise authenticated behavior and never ship through the entry point. No identity provider was enabled in Sprint 0. Use @netlify/identity when integrating Netlify Identity in Sprint 1; require invitation-only registration and server-controlled workspace membership and roles before enabling access.
+`AuthProvider` accepts an Authentication implementation. Since Sprint 1.7 the entry point supplies `serverSessionAuth`, a cookie-only adapter for the `/api/auth/*` Netlify Function. That function uses Supabase Auth (with Resend SMTP) as the credential verifier and keeps sessions, membership, roles, and audit in Netlify Database. The plan to use Netlify Identity is superseded. See [authentication.md](authentication.md). `unconfiguredAuth` remains for tests.
 
 The UI guard is a presentation boundary, not operational authorization. Future Netlify Functions must verify identity, load trusted workspace membership and assignments, and enforce `authorization.can` for every requested resource. Do not accept roles, assignments, or approval authority from browser input or user-editable metadata. Missing, invalid, expired, or unrecognized membership must fail closed. Database query predicates must enforce the same scope before pagination, aggregates, exports, or writes.
 
@@ -48,7 +48,7 @@ All workspace screens are explicit future-sprint placeholders with role guards. 
 
 ## Future deployment and storage
 
-Vite emits static assets to `dist`. Netlify uses the checked-in build command and SPA fallback. Future server endpoints belong in `netlify/functions`. No endpoints, tables, migrations, credentials, or persisted records exist in this sprint. Use Netlify Database managed PostgreSQL with @netlify/database and Drizzle in Sprint 1; define the eventual schema in `db/schema.ts` only after the domain model and identity mapping are approved. Do not introduce browser persistence or an external database for application records.
+Vite emits static assets to `dist`. Netlify uses the checked-in build command and SPA fallback. Future server endpoints belong in `netlify/functions`. Sprint 1.7 adds the auth function. Its tables are staged as an unapplied proposal in `db/proposals/sprint-1.7-auth`, and no migrations exist in `netlify/database/migrations`. Use Netlify Database managed PostgreSQL with @netlify/database and Drizzle in Sprint 1; define the eventual schema in `db/schema.ts` only after the domain model and identity mapping are approved. Do not introduce browser persistence or an external database for application records.
 
 ## Security and release limits
 
