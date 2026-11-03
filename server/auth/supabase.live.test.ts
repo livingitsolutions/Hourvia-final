@@ -21,7 +21,10 @@ const testUserAllowed = !!testEmail && !!env.HOURVIA_LIVE_TEST_PASSWORD && (mode
 
 describe.skipIf(!enabled)(`LIVE Supabase Auth (${mode})`, () => {
   it('has public self-registration disabled and email auth enabled', async () => {
-    const res = await fetch(`${env.SUPABASE_URL}/auth/v1/settings`, { headers: { apikey: env.SUPABASE_ANON_KEY! } });
+    // Uses the resolved key (SUPABASE_PUBLISHABLE_KEY, else legacy SUPABASE_ANON_KEY), never the secret key.
+    const res = await fetch(`${env.SUPABASE_URL}/auth/v1/settings`, { headers: { apikey: publishableKey! } });
+    // Fail with the HTTP status (no headers or body echoed) instead of an opaque JSON-shape error.
+    expect(res.status).toBe(200);
     const settings = await res.json() as { disable_signup: boolean; mailer_autoconfirm?: boolean; external: Record<string, boolean> };
     expect(settings.disable_signup).toBe(true);
     expect(settings.external.email).toBe(true);
