@@ -2,6 +2,7 @@ import { getDatabase } from '@netlify/database';
 import { readServerEnv, type EnvReader } from './config';
 import type { DepsFactory } from './http';
 import { SupabaseIdentityProvider } from './provider-supabase';
+import { roleScopedSqlClient } from './sql-role';
 import { PostgresAuthStore } from './store-postgres';
 import type { SqlClient } from './types';
 
@@ -25,7 +26,8 @@ export function poolSqlClient(pool: PgLikePool): SqlClient {
 }
 
 let sharedStore: PostgresAuthStore | null = null;
-const store = () => (sharedStore ??= new PostgresAuthStore(poolSqlClient(getDatabase().pool as unknown as PgLikePool)));
+// Every auth statement runs as the restricted hourvia_auth_runtime role, never with the owner's privileges.
+const store = () => (sharedStore ??= new PostgresAuthStore(roleScopedSqlClient(poolSqlClient(getDatabase().pool as unknown as PgLikePool))));
 
 /** Production wiring for Netlify Functions. All secrets come from protected environment variables. */
 export function runtimeDeps(env: EnvReader, deployContext: string | undefined): DepsFactory {

@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { createHarness, type Harness } from './testing/harness';
 import { messages } from './service';
 import { sha256Hex } from './crypto';
+import { handleAuthRequest } from './http';
 
 let h: Harness;
 beforeEach(async () => { h = await createHarness(); });
@@ -312,5 +313,93 @@ describe('fail-closed infrastructure', () => {
     const res = await bare.call('POST', '/api/auth/login', { body: { email: 'a@t.test', password: 'x' } });
     expect(res.status).toBe(503); expect(res.text).not.toMatch(/relation|does not exist|stack/i);
     expect((await bare.call('GET', '/api/auth/session', { cookie: 'A'.repeat(43) })).status).toBe(503);
+  });
+});
+
+describe('production smoke-test stage (designated test accounts only)', () => {
+  const SMOKE = ['admin@thrivesource.test', 'c.smoke@t.test', 'm.smoke@t.test'];
+  beforeEach(async () => { h = await createHarness({ config: { smokeTestEmails: new Set(SMOKE) } }); });
+
+  it('denies a real user before Supabase is contacted, with the generic message', async () => {
+    const real = await h.seedMember('real.person@t.test', 'contractor');
+    const issuedBefore = h.provider.issued.length;
+    const res = await h.login(real.email);
+    expect(res.status).toBe(401); expect(res.json!.message).toBe(messages.loginFailed); expect(res.cookie).toBeNull();
+    expect(h.provider.issued.length).toBe(issuedBefore);
+  });
+  it('lets designated test accounts sign in, be invited, activate and recover', async () => {
+    const admin = await adminSession();
+    expect(admin.cookie).toBeTruthy();
+    const { password } = await inviteAndAccept(admin.cookie, 'c.smoke@t.test', 'contractor');
+    expect((await h.login('c.smoke@t.test', password)).status).toBe(200);
+    expect((await h.call('POST', '/api/auth/recovery/request', { body: { email: 'c.smoke@t.test' } })).status).toBe(202);
+    expect(h.provider.recoverySent).toEqual(['c.smoke@t.test']);
+  });
+  it('refuses to invite, email, disable or end sessions for anyone outside the list', async () => {
+    const admin = await adminSession();
+    const invite = await h.call('POST', '/api/admin/invitations', { cookie: admin.cookie, body: { email: 'real.invitee@t.test', role: 'contractor' } });
+    expect(invite.status).toBe(403); expect(h.provider.invited).toEqual([]);
+    const real = await h.seedMember('real.person@t.test', 'contractor');
+    const recovery = await h.call('POST', '/api/auth/recovery/request', { body: { email: real.email } });
+    expect(recovery.status).toBe(202); expect(recovery.json!.message).toBe(messages.recoveryAccepted); expect(h.provider.recoverySent).toEqual([]);
+    expect((await h.call('POST', '/api/auth/recovery/complete', { body: { email: real.email, code: '482913', password: 'another long passphrase' } })).status).toBe(400);
+    expect((await h.call('POST', `/api/admin/members/${real.id}/disable`, { cookie: admin.cookie, body: {} })).status).toBe(403);
+    expect((await h.call('POST', `/api/admin/members/${real.id}/revoke-sessions`, { cookie: admin.cookie, body: {} })).status).toBe(403);
+    expect(h.provider.banned).toEqual([]);
+    const { rows } = await h.pg.query<{ status: string }>(`SELECT status FROM workspace_members WHERE id = $1`, [real.id]);
+    expect(rows[0]!.status).toBe('active');
+  });
+  it('ends an existing session once its account leaves the list', async () => {
+    const c = await h.seedMember('c.smoke@t.test', 'contractor');
+    const s = await h.login(c.email);
+    expect((await h.call('GET', '/api/auth/session', { cookie: s.cookie })).status).toBe(200);
+    (h.deps.config as { smokeTestEmails: ReadonlySet<string> | null }).smokeTestEmails = new Set(['admin@thrivesource.test']);
+    expect((await h.call('GET', '/api/auth/session', { cookie: s.cookie })).status).toBe(401);
+  });
+});
+
+describe('restricted database role (staged 002 proposal, enforced by real Postgres 18 privileges)', () => {
+  const asRuntime = (text: string) => h.sql.query(text);
+  it('switches every store statement to a non-bypass role and fails closed without it', async () => {
+    const { rows } = await h.sql.query<{ u: string; bypass: boolean; superuser: boolean }>(`SELECT current_user AS u, rolbypassrls AS bypass, rolsuper AS superuser FROM pg_roles WHERE rolname = current_user`);
+    expect(rows[0]).toEqual({ u: 'hourvia_auth_runtime', bypass: false, superuser: false });
+    const noRole = await createHarness({ restrictedRole: false });
+    await noRole.seedMember('a@t.test', 'workspace_admin');
+    const res = await noRole.login('a@t.test');
+    expect(res.status).toBe(503); expect(res.cookie).toBeNull();
+  });
+  it('cannot read, change or erase the audit trail', async () => {
+    await h.login((await h.seedMember('a@t.test', 'workspace_admin')).email);
+    await expect(asRuntime(`SELECT * FROM auth_audit_events`)).rejects.toThrow(/permission denied/);
+    await expect(asRuntime(`DELETE FROM auth_audit_events`)).rejects.toThrow(/permission denied/);
+    await expect(asRuntime(`UPDATE auth_audit_events SET outcome = 'success'`)).rejects.toThrow(/permission denied/);
+    await expect(asRuntime(`TRUNCATE auth_audit_events`)).rejects.toThrow(/permission denied/);
+    await expect(asRuntime(`ALTER TABLE auth_audit_events DISABLE TRIGGER ALL`)).rejects.toThrow(/must be owner/);
+  });
+  it('cannot escalate privileges, rebind identities or change schema', async () => {
+    const m = await h.seedMember('m@t.test', 'workspace_manager');
+    await expect(asRuntime(`UPDATE workspace_members SET approval_authorized = true`)).rejects.toThrow(/permission denied/);
+    await expect(asRuntime(`UPDATE workspace_members SET auth_user_id = gen_random_uuid()`)).rejects.toThrow(/permission denied/);
+    await expect(asRuntime(`UPDATE workspace_members SET role = 'workspace_admin' WHERE id = '${m.id}'`)).rejects.toThrow(/only while invited/);
+    await expect(asRuntime(`INSERT INTO manager_assignments (workspace_id, manager_member_id, contractor_member_id) VALUES ('thrivesource', '${m.id}', '${m.id}')`)).rejects.toThrow(/permission denied/);
+    await expect(asRuntime(`DELETE FROM auth_sessions`)).rejects.toThrow(/permission denied/);
+    await expect(asRuntime(`DELETE FROM workspace_members`)).rejects.toThrow(/permission denied/);
+    await expect(asRuntime(`CREATE TABLE stolen (x int)`)).rejects.toThrow(/permission denied/);
+    await expect(asRuntime(`DROP TABLE auth_sessions`)).rejects.toThrow(/must be owner/);
+    await expect(asRuntime(`CREATE ROLE sneaky`)).rejects.toThrow(/permission denied/);
+  });
+  it('keeps disabling terminal even for the owner', async () => {
+    const c = await h.seedMember('c@t.test', 'contractor', 'correct horse battery', { status: 'disabled' });
+    await expect(h.pg.query(`UPDATE workspace_members SET status = 'active' WHERE id = $1`, [c.id])).rejects.toThrow(/cannot be re-enabled/);
+  });
+});
+
+describe('canonical origin pinning', () => {
+  it('refuses auth on any hostname other than the configured app origin', async () => {
+    await h.seedMember('a@t.test', 'workspace_admin');
+    const other = 'https://hourvia-tracker.netlify.app';
+    const res = await handleAuthRequest(new Request(`${other}/api/auth/login`, { method: 'POST', headers: { origin: other, 'content-type': 'application/json' }, body: JSON.stringify({ email: 'a@t.test', password: 'correct horse battery' }) }), '203.0.113.10', async () => h.deps);
+    expect(res.status).toBe(421); expect(res.headers.get('set-cookie')).toBeNull();
+    expect((await h.login('a@t.test')).status).toBe(200);
   });
 });

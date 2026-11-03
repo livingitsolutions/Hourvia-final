@@ -73,6 +73,9 @@ export async function handleAuthRequest(req: Request, ip: string | undefined, ma
   try {
     const deps = await makeDeps();
     if ('unavailable' in deps) return error(503, 'auth_unavailable', 'Workspace sign-in is temporarily unavailable. Contact your workspace administrator.');
+    // Pin auth to the canonical origin (the one Supabase email links use). Requests to other hostnames that
+    // serve the same deploy, such as *.netlify.app, are refused.
+    if (deps.config.appOrigin && new URL(req.url).origin !== deps.config.appOrigin) return error(421, 'wrong_origin', 'Open Hourvia at its main address to sign in.');
     const meta: RequestMeta = { ip: ip || 'unknown', sessionToken: readSessionCookie(req.headers.get('cookie')) };
     return respond(await found.route.run(new AuthService(deps), meta, body, found.match!));
   } catch {

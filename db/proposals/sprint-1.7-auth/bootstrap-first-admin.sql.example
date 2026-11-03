@@ -1,10 +1,12 @@
 -- Reviewed, one-time bootstrap of the first ThriveSource Workspace Admin (EXAMPLE — DO NOT AUTO-APPLY).
 -- Invitation-only onboarding needs one admin to exist. This does NOT migrate any Netlify Identity
 -- account or password. Steps:
---   1. In the NONPRODUCTION Supabase project: Authentication → Users → "Invite user" for the admin email.
+--   0. Only with explicit approval (Gate 4 of docs/production-activation-plan.md). During the smoke stage the
+--      admin email MUST be a designated test mailbox listed in HOURVIA_AUTH_SMOKE_TEST_EMAILS; never a real user.
+--   1. In the Hourvia_Authentication Supabase project: Authentication → Users → "Invite user" for that email.
 --      (Uses the Hourvia invite template, so the link points at /accept-invite and is consumed server-side.)
 --   2. Copy the new user's UUID and run the statement below, with real values, against the matching
---      nonproduction database after the 001 proposal has been promoted.
+--      production Netlify Database, by hand, after the 001 migration has been promoted and applied.
 --   3. The admin opens the email, sets their own password, then signs in.
 WITH member AS (
   INSERT INTO workspace_members (workspace_id, auth_user_id, email, display_name, role, status)
