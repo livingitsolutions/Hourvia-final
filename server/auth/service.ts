@@ -25,7 +25,19 @@ const fail = (status: number, error: string, message: string): Outcome => ({ sta
 const invalid = (issues: z.core.$ZodIssue[]): Outcome => ({ status: 400, body: { error: 'invalid_request', message: 'Check the highlighted fields.', fields: Object.fromEntries(issues.map(i => [String(i.path[0] ?? 'form'), i.message])) } });
 const publicMember = (m: MemberRecord) => ({ id: m.id, email: m.email, name: m.displayName || m.email, role: m.role, status: m.status, createdAt: m.createdAt.toISOString() });
 
-interface Limit { name: string; key: string; max: number; windowSeconds: number }
+/** auditOnce: record only the first rejection per window, so a flood of rejected requests writes one audit row, not one per request. */
+interface Limit { name: string; key: string; max: number; windowSeconds: number; auditOnce?: boolean }
+
+/**
+ * Platform request limits (Sprint 1.8B, audit finding M-1). Both protected paths write to append-only audit tables:
+ * a denial writes auth_audit_events, an audit-page read writes platform_audit_events. The limit is checked first, so
+ * a caller over the limit gets 429 and writes nothing more than one rate_limited row per window.
+ */
+export const PLATFORM_LIMITS = {
+  deniedPerMember: { name: 'platform_denied', max: 10, windowSeconds: 3600 },
+  deniedPerIp: { name: 'platform_denied_ip', max: 30, windowSeconds: 3600 },
+  auditReadsPerMember: { name: 'platform_audit_read', max: 60, windowSeconds: 3600 },
+} as const;
 
 export class AuthService {
   constructor(private readonly deps: AuthDeps) {}
@@ -43,7 +55,7 @@ export class AuthService {
       const windowMs = limit.windowSeconds * 1000;
       const hits = await this.deps.store.hitRateLimit(`${limit.name}:${this.hmac(limit.name, limit.key)}`, new Date(Math.floor(nowMs / windowMs) * windowMs));
       if (hits > limit.max) {
-        await this.audit({ eventType: 'rate_limited', outcome: 'denied', ipHmac: this.hmac('ip', ip), details: { limit: limit.name } });
+        if (!limit.auditOnce || hits === limit.max + 1) await this.audit({ eventType: 'rate_limited', outcome: 'denied', ipHmac: this.hmac('ip', ip), details: { limit: limit.name } });
         return fail(429, 'rate_limited', messages.rateLimited);
       }
     }
@@ -364,7 +376,8 @@ export class AuthService {
   /**
    * Platform guard. Authorizes from the platform plane only (platformAuthorization never reads the organization role
    * or workspace permissions), then the database re-authorizes from the session itself inside hourvia_platform_*.
-   * Unauthenticated → 401. Authenticated without the platform permission → 403, audited in auth_audit_events.
+   * Unauthenticated → 401. Authenticated without the platform permission → 403, audited in auth_audit_events, or 429
+   * once the caller exceeds PLATFORM_LIMITS (checked before the denial is audited).
    */
   private async platform(meta: RequestMeta, permission: PlatformPermission): Promise<{ principal: Principal; tokenHash: string } | Outcome> {
     const principal = await this.authenticate(meta.sessionToken);
@@ -373,6 +386,12 @@ export class AuthService {
     return { principal, tokenHash: sha256Hex(meta.sessionToken) };
   }
   private async platformDenied(principal: Principal, meta: RequestMeta, permission: PlatformPermission, reason: string): Promise<Outcome> {
+    // Limit before auditing: past the limit the caller gets 429 and no further denial rows are written.
+    const blocked = await this.limited(meta.ip, [
+      { ...PLATFORM_LIMITS.deniedPerMember, key: principal.id, auditOnce: true },
+      { ...PLATFORM_LIMITS.deniedPerIp, key: meta.ip, auditOnce: true },
+    ]);
+    if (blocked) return blocked;
     await this.audit({ eventType: 'platform_access', outcome: 'denied', actorMemberId: principal.id, ipHmac: this.hmac('ip', meta.ip), details: { permission, reason } });
     return fail(403, 'platform_forbidden', messages.platformForbidden);
   }
@@ -390,6 +409,9 @@ export class AuthService {
     if ('status' in guard) return guard;
     const page = parseAuditQuery(query);
     if ('error' in page) return { status: 400, body: { error: 'invalid_request', message: page.error } };
+    // Every audit-page read is recorded in platform_audit_events, so reads are limited before the database call.
+    const blocked = await this.limited(meta.ip, [{ ...PLATFORM_LIMITS.auditReadsPerMember, key: guard.principal.id, auditOnce: true }]);
+    if (blocked) return blocked;
     const result = await this.deps.store.platformAuditPage(guard.tokenHash, page);
     if (!result) return this.platformDenied(guard.principal, meta, 'platform.audit.read', 'database_denied');
     return ok(result);
