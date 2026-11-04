@@ -1,11 +1,21 @@
+import { readServerEnv } from './config';
 import { createClient, isAuthError, type SupabaseClient } from '@supabase/supabase-js';
 import { ProviderConflictError, type IdentityProvider, type OtpVerification, type ProviderSession } from './types';
+
+// Refuse default network transport outside a verified production Function. Injected transports exist only for offline tests.
+const productionFetch: typeof fetch = async (input, init) => {
+  const context = typeof Netlify === 'undefined' ? null : Netlify.context;
+  if (!context || 'unavailable' in readServerEnv(name => Netlify.env.get(name), context.deploy?.context, {
+    siteId: context.site?.id, deployId: context.deploy?.id, published: context.deploy?.published,
+  })) throw new Error('identity_provider_context_not_enabled');
+  return fetch(input, init);
+};
 
 // Server-only: no session persistence, no auto refresh, no URL session detection. Each call uses a fresh
 // client so no token state can leak between requests that share a warm function instance.
 const serverClient = (url: string, key: string, fetchImpl?: typeof fetch): SupabaseClient => createClient(url, key, {
   auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
-  ...(fetchImpl ? { global: { fetch: fetchImpl } } : {}),
+  global: { fetch: fetchImpl ?? productionFetch },
 });
 
 /** A 4xx from Supabase Auth is a credential/verification rejection; anything else is an outage. */

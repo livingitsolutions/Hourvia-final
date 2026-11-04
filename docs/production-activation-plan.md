@@ -1,3 +1,5 @@
+> Superseded operational guidance: use [Sprint 2.0B.2 production pre-launch controls](production-prelaunch.md). Earlier activation, general-stage, dev/provider, invitation and preview-promotion steps below are historical and must not be executed as current instructions.
+
 # Hourvia authentication: production activation plan
 
 **Decision (2026-11-03):** the Supabase project **Hourvia_Authentication** is the production authentication provider. No separate nonproduction Supabase project will be created. Correctness and security are proven locally against disposable databases and mocked providers. Production then gets a limited, explicitly authorized smoke test that uses designated test accounts only.

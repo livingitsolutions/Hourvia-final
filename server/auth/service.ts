@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { identityAllowed } from './synthetic-policy';
 import { belongsToOrganization } from '../../src/domain/organization';
 import { authorization, canAssignRole, canManageMember, hasPlatformPrivilege, WORKSPACE_ID, type Principal } from '../../src/domain/permissions';
 import { acceptInvitationSchema, adminInviteSchema, loginSchema, memberRoleChangeSchema, recoveryCompleteSchema, recoveryRequestSchema } from '../../src/domain/contracts';
@@ -47,6 +48,12 @@ export class AuthService {
   private audit(event: AuditEvent) { return this.deps.store.audit(event, this.now); }
   /** True while the production smoke-test stage is active and this email is not a designated test account. */
   private outsideSmoke(email: string) { const allow = this.deps.config.smokeTestEmails; return !!allow && !allow.has(email.trim().toLowerCase()); }
+  private async approvedMember(member: MemberRecord | null): Promise<boolean> {
+    const policy = this.deps.config.prelaunch;
+    return !policy || !!member && identityAllowed(policy, member)
+      && belongsToOrganization(this.deps.store.context, member.organizationId)
+      && !(await this.deps.store.platformPrivileges(member.authUserId!)).length;
+  }
   private async bestEffort(fn: () => Promise<unknown>) { try { await fn(); } catch { /* provider hygiene only; Hourvia state is authoritative */ } }
 
   /** Fixed-window limits, keyed by HMAC so raw emails and IPs are never stored. */
@@ -82,7 +89,7 @@ export class AuthService {
     if (!token || !isSessionTokenShape(token)) return null;
     const now = this.now;
     const session = await this.deps.store.resolveSession(sha256Hex(token), now);
-    if (!session || this.outsideSmoke(session.member.email)) return null;
+    if (!session || this.outsideSmoke(session.member.email) || !await this.approvedMember(session.member)) return null;
     if (now.getTime() - session.lastSeenAt.getTime() > 60_000) {
       await this.deps.store.touchSession(session.sessionId, now, new Date(now.getTime() + this.deps.config.idleTimeoutSeconds * 1000));
     }
@@ -110,16 +117,25 @@ export class AuthService {
       return fail(401, 'login_failed', messages.loginFailed);
     }
 
+    const expected = this.deps.config.prelaunch ? await this.deps.store.findMemberByEmail(email) : null;
+    if (this.deps.config.prelaunch && (expected?.status !== 'active' || !await this.approvedMember(expected))) {
+      await this.audit({ eventType: 'login', outcome: 'denied', emailHmac, ipHmac, details: { reason: 'identity_not_authorized' } });
+      return fail(401, 'login_failed', messages.loginFailed);
+    }
     const providerSession = await this.deps.provider.signInWithPassword(email, parsed.data.password);
     if (!providerSession) {
       await this.audit({ eventType: 'login', outcome: 'denied', emailHmac, ipHmac, details: { reason: 'credentials' } });
+      return fail(401, 'login_failed', messages.loginFailed);
+    }
+    if (expected && providerSession.userId !== expected.authUserId) {
+      await this.audit({ eventType: 'login', outcome: 'denied', emailHmac, ipHmac, details: { reason: 'provider_identity_mismatch' } });
       return fail(401, 'login_failed', messages.loginFailed);
     }
     // Hourvia issues its own session; the provider session is revoked so no refresh token survives anywhere.
     await this.bestEffort(() => this.deps.provider.revokeSession(providerSession.accessToken, 'local'));
     const member = await this.deps.store.findMemberByAuthUserId(providerSession.userId);
     const principal = member ? await this.principal(member) : null;
-    if (!member || !principal) {
+    if (!member || !principal || !await this.approvedMember(member) || (expected && member.id !== expected.id)) {
       await this.audit({ eventType: 'login', outcome: 'denied', subjectMemberId: member?.id, emailHmac, ipHmac, details: { reason: member ? `member_${member.status}` : 'no_membership' } });
       return fail(401, 'login_failed', messages.loginFailed);
     }
@@ -153,7 +169,7 @@ export class AuthService {
     if (blocked) return blocked;
     let result: 'sent' | 'not_eligible' | 'smoke_allowlist' | 'delivery_not_authorized' | 'provider_error' = 'not_eligible';
     const member = await this.deps.store.findMemberByEmail(email);
-    if (member?.status === 'active' && member.authUserId && this.outsideSmoke(email)) result = 'smoke_allowlist';
+    if (member?.status === 'active' && member.authUserId && (this.outsideSmoke(email) || !await this.approvedMember(member))) result = 'smoke_allowlist';
     else if (member?.status === 'active' && member.authUserId) {
       if (!this.deps.config.emailDeliveryAuthorized || !this.deps.config.appOrigin) result = 'delivery_not_authorized';
       else {
@@ -182,14 +198,23 @@ export class AuthService {
       await this.audit({ eventType: 'recovery_completed', outcome: 'denied', emailHmac, ipHmac, details: { reason: 'smoke_allowlist' } });
       return fail(400, 'recovery_failed', messages.recoveryFailed);
     }
+    const expected = this.deps.config.prelaunch && email ? await this.deps.store.findMemberByEmail(email) : null;
+    if (this.deps.config.prelaunch && (!email || expected?.status !== 'active' || !await this.approvedMember(expected))) {
+      await this.audit({ eventType: 'recovery_completed', outcome: 'denied', emailHmac, ipHmac, details: { reason: 'identity_not_authorized' } });
+      return fail(400, 'recovery_failed', messages.recoveryFailed);
+    }
     const verified = await this.deps.provider.verifyEmailOtp(email && 'code' in data ? { type: 'recovery', email, code: data.code } : { type: 'recovery', tokenHash: (data as { tokenHash: string }).tokenHash });
     if (!verified) {
       await this.audit({ eventType: 'recovery_completed', outcome: 'denied', emailHmac, ipHmac, details: { reason: 'verification' } });
       return fail(400, 'recovery_failed', messages.recoveryFailed);
     }
+    if (expected && verified.userId !== expected.authUserId) {
+      await this.audit({ eventType: 'recovery_completed', outcome: 'denied', emailHmac, ipHmac, details: { reason: 'provider_identity_mismatch' } });
+      return fail(400, 'recovery_failed', messages.recoveryFailed);
+    }
     const member = await this.deps.store.findMemberByAuthUserId(verified.userId);
-    if (member?.status !== 'active' || this.outsideSmoke(member.email)) {
-      await this.bestEffort(() => this.deps.provider.revokeSession(verified.accessToken, 'global'));
+    if (member?.status !== 'active' || this.outsideSmoke(member.email) || !await this.approvedMember(member) || (expected && member.id !== expected.id)) {
+      if (!this.deps.config.prelaunch) await this.bestEffort(() => this.deps.provider.revokeSession(verified.accessToken, 'global'));
       await this.audit({ eventType: 'recovery_completed', outcome: 'denied', subjectMemberId: member?.id, emailHmac, ipHmac, details: { reason: !member ? 'no_membership' : member.status !== 'active' ? `member_${member.status}` : 'smoke_allowlist' } });
       return fail(400, 'recovery_failed', messages.recoveryFailed);
     }
@@ -211,6 +236,10 @@ export class AuthService {
     const blocked = await this.limited(meta.ip, [{ name: 'invite_accept_ip', key: meta.ip, max: 10, windowSeconds: 3600 }]);
     if (blocked) return blocked;
     const ipHmac = this.hmac('ip', meta.ip);
+    if (this.deps.config.prelaunch) {
+      await this.audit({ eventType: 'invitation_accepted', outcome: 'denied', ipHmac, details: { reason: 'challenge_preauthorization_required' } });
+      return fail(400, 'invitation_failed', messages.inviteFailed);
+    }
     const verified = await this.deps.provider.verifyEmailOtp({ type: 'invite', tokenHash: parsed.data.tokenHash });
     if (!verified) {
       await this.audit({ eventType: 'invitation_accepted', outcome: 'denied', ipHmac, details: { reason: 'verification' } });
@@ -219,7 +248,7 @@ export class AuthService {
     const now = this.now;
     const member = await this.deps.store.findMemberByAuthUserId(verified.userId);
     if (!member || member.status !== 'invited' || this.outsideSmoke(member.email) || !(await this.deps.store.hasPendingInvitation(member.id, now))) {
-      await this.bestEffort(() => this.deps.provider.revokeSession(verified.accessToken, 'global'));
+      if (!this.deps.config.prelaunch) await this.bestEffort(() => this.deps.provider.revokeSession(verified.accessToken, 'global'));
       await this.audit({ eventType: 'invitation_accepted', outcome: 'denied', subjectMemberId: member?.id, ipHmac, details: { reason: member ? `member_${member.status}_or_expired` : 'no_invitation' } });
       return fail(400, 'invitation_failed', messages.inviteFailed);
     }
@@ -262,6 +291,12 @@ export class AuthService {
         await this.audit({ eventType: 'invitation_created', outcome: 'denied', actorMemberId: admin.id, details: { reason: 'platform_privilege_not_assignable' } });
       }
       return invalid(parsed.error.issues);
+    }
+    if (this.deps.config.prelaunch) {
+      const blocked = await this.limited(meta.ip, [{ name: 'admin_invite', key: admin.id, max: 30, windowSeconds: 3600 }]);
+      if (blocked) return blocked;
+      await this.audit({ eventType: 'invitation_created', outcome: 'denied', actorMemberId: admin.id, details: { reason: 'challenge_preauthorization_required' } });
+      return fail(503, 'invitation_unavailable', 'Invitation onboarding is unavailable during pre-launch.');
     }
     const cfg = this.deps.config;
     if (!cfg.emailDeliveryAuthorized || !cfg.appOrigin) return fail(503, 'email_delivery_not_authorized', 'Invitation email delivery is not authorized in this environment.');
@@ -334,7 +369,7 @@ export class AuthService {
       await this.audit({ eventType: 'member_role_changed', outcome: 'denied', actorMemberId: admin.id, subjectMemberId: target.id, details: { reason: 'role_not_assignable', from_role: target.role, role } });
       return fail(403, 'privilege_denied', messages.privilegeDenied);
     }
-    if (this.outsideSmoke(target.email)) return fail(403, 'smoke_allowlist', 'During production smoke testing, only designated test accounts can be changed.');
+    if (this.outsideSmoke(target.email) || !await this.approvedMember(target)) return fail(403, 'smoke_allowlist', 'During production smoke testing, only designated test accounts can be changed.');
     if (target.status !== 'active') return fail(409, 'member_not_active', target.status === 'invited' ? 'Send a new invitation with the new role instead.' : 'Disabled members cannot change role.');
     if (target.role === role) return fail(409, 'role_unchanged', 'This member already has that role.');
     const changed = await this.deps.store.changeMemberRole({ memberId: target.id, expectedRole: target.role, role, changedBy: admin.id, now: this.now });
@@ -352,7 +387,7 @@ export class AuthService {
     if (!target) return fail(404, 'not_found', 'Member not found.');
     const denied = await this.manageable(admin, target, 'member_disabled');
     if (denied) return denied;
-    if (this.outsideSmoke(target.email)) return fail(403, 'smoke_allowlist', 'During production smoke testing, only designated test accounts can be changed.');
+    if (this.outsideSmoke(target.email) || !await this.approvedMember(target)) return fail(403, 'smoke_allowlist', 'During production smoke testing, only designated test accounts can be changed.');
     const changed = await this.deps.store.disableMember(memberId, admin.id, this.now);
     const revoked = await this.deps.store.revokeMemberSessions(memberId, 'member_disabled', this.now, admin.id);
     let providerBanned = false;
@@ -369,7 +404,7 @@ export class AuthService {
     // Ending your own sessions is always allowed; anyone else needs authority over the member's role.
     const denied = target.id === admin.id ? null : await this.manageable(admin, target, 'sessions_revoked');
     if (denied) return denied;
-    if (this.outsideSmoke(target.email)) return fail(403, 'smoke_allowlist', 'During production smoke testing, only designated test accounts can be changed.');
+    if (this.outsideSmoke(target.email) || !await this.approvedMember(target)) return fail(403, 'smoke_allowlist', 'During production smoke testing, only designated test accounts can be changed.');
     const revoked = await this.deps.store.revokeMemberSessions(memberId, target.id === admin.id ? 'self_revoked' : 'admin_revoked', this.now, admin.id);
     await this.audit({ eventType: 'sessions_revoked', outcome: 'success', actorMemberId: admin.id, subjectMemberId: memberId, details: { sessions_revoked: revoked, target_role: target.role, authority: target.id === admin.id ? 'self' : this.authority(admin, target.role) } });
     return ok({ sessionsRevoked: revoked });

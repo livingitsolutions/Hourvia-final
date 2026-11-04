@@ -1,3 +1,5 @@
+> Superseded operational guidance: use [Sprint 2.0B.2 production pre-launch controls](production-prelaunch.md). Earlier activation, general-stage, dev/provider, invitation and preview-promotion steps below are historical and must not be executed as current instructions.
+
 # Hourvia authentication: production preflight (2026-11-03)
 
 This audit was done before approving database migrations or production activation. Nothing was applied, deployed, merged, emailed or created, and production authentication stays disabled.

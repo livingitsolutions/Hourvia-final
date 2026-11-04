@@ -1,3 +1,5 @@
+> Superseded operational guidance: use [Sprint 2.0B.2 production pre-launch controls](production-prelaunch.md). Earlier activation, general-stage, dev/provider, invitation and preview-promotion steps below are historical and must not be executed as current instructions.
+
 # Hourvia production authentication smoke test: runbook (Sprint 1.9B)
 
 **Status: PREPARED, NOT EXECUTED.** Production authentication is disabled. Nothing in this runbook has been run.

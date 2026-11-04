@@ -1,3 +1,5 @@
+> Superseded operational guidance: use [Sprint 2.0B.2 production pre-launch controls](production-prelaunch.md). Earlier activation, general-stage, dev/provider, invitation and preview-promotion steps below are historical and must not be executed as current instructions.
+
 # Hourvia Sprint 1.7: auth migration readiness and promotion checklist (2026-11-03)
 
 This review covers the two staged files in `db/proposals/sprint-1.7-auth/`. **Nothing was applied to any Netlify database.** Nothing was merged, deployed, emailed or created, and authentication stays disabled. Both files stay outside `netlify/database/migrations/`, which doesn't exist in the repository.

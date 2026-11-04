@@ -98,13 +98,16 @@ export interface IdentityProvider {
 export class ProviderConflictError extends Error {}
 
 export interface AuthConfig {
+  /** Only runtime production wiring supplies this mandatory pre-launch identity binding. */
+  prelaunch?: import('./synthetic-policy').IdentityPolicy;
   hashKey: string;
   appOrigin: string | null;
   emailDeliveryAuthorized: boolean;
   /**
    * Production smoke-test stage: when set, only these (lower-cased) designated test emails can sign in, be
    * invited, recover a password, hold a session, or be administered. Everyone else is denied before any
-   * provider call, so real Supabase users are never touched. null = general availability.
+   * provider call for identity-bearing flows. Runtime pre-launch wiring also blocks opaque tokens.
+   * null is reserved for offline legacy fixtures; production wiring never accepts general availability.
    */
   smokeTestEmails: ReadonlySet<string> | null;
   idleTimeoutSeconds: number;
