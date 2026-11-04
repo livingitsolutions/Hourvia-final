@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { belongsToOrganization } from '../../src/domain/organization';
 import { authorization, canAssignRole, canManageMember, hasPlatformPrivilege, WORKSPACE_ID, type Principal } from '../../src/domain/permissions';
 import { acceptInvitationSchema, adminInviteSchema, loginSchema, memberRoleChangeSchema, recoveryCompleteSchema, recoveryRequestSchema } from '../../src/domain/contracts';
 import { PLATFORM_AUDIT_DEFAULT_LIMIT, PLATFORM_AUDIT_MAX_LIMIT, platformAuthorization, type PlatformPermission } from '../../src/domain/platform';
@@ -64,6 +65,8 @@ export class AuthService {
 
   private async principal(member: MemberRecord): Promise<Principal | null> {
     if (member.workspaceId !== WORKSPACE_ID || member.status !== 'active') return null;
+    // Sprint 2.0B: the membership must also belong to the store's server-derived organization context (fail closed).
+    if (!belongsToOrganization(this.deps.store.context, member.organizationId)) return null;
     const manager = member.role === 'workspace_manager';
     return {
       id: member.id, name: member.displayName || member.email, role: member.role, workspaceId: WORKSPACE_ID,

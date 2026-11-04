@@ -1,3 +1,4 @@
+import type { Organization, OrganizationContext, OrganizationId } from '../../src/domain/organization';
 import type { PlatformPrivilege, Role } from '../../src/domain/permissions';
 import type { PlatformAuditPage, PlatformOverview } from '../../src/domain/platform';
 
@@ -11,6 +12,8 @@ export type MemberStatus = 'invited' | 'active' | 'disabled';
 export interface MemberRecord {
   id: string;
   workspaceId: string;
+  /** M7 organization_id. Always ThriveSource in Sprint 2.0B; never taken from request input. */
+  organizationId: OrganizationId;
   authUserId: string | null;
   email: string;
   displayName: string;
@@ -32,7 +35,18 @@ export interface AuditEvent {
   details?: Record<string, string | number | boolean | null>;
 }
 
-export interface AuthStore {
+/**
+ * Tenant-aware store (Sprint 2.0B). A store instance is bound to exactly one server-derived OrganizationContext, and
+ * every tenant query it issues is scoped to that organization (see tenant-sql.ts). No method accepts an organization
+ * identifier as an argument, so a caller cannot redirect a query to another tenant.
+ */
+export interface TenantScopedStore {
+  readonly context: OrganizationContext;
+  /** The context's organization (runtime-readable columns only), or null if it does not exist. */
+  organization(): Promise<Organization | null>;
+}
+
+export interface AuthStore extends TenantScopedStore {
   findMemberById(id: string): Promise<MemberRecord | null>;
   findMemberByEmail(email: string): Promise<MemberRecord | null>;
   findMemberByAuthUserId(authUserId: string): Promise<MemberRecord | null>;

@@ -1,11 +1,18 @@
+import { THRIVESOURCE_SYSTEM_CONTEXT, parseOrganizationId, type Organization, type OrganizationContext, type OrganizationId } from '../../src/domain/organization';
 import { WORKSPACE_ID, type PlatformPrivilege, type Role } from '../../src/domain/permissions';
 import { isPlatformPrivilege, type PlatformAuditDetail, type PlatformAuditEvent, type PlatformAuditPage, type PlatformOverview } from '../../src/domain/platform';
+import { organizationScopedSqlClient } from './tenant-sql';
 import type { AuditEvent, AuthStore, MemberRecord, SessionRecord, SqlClient } from './types';
 
-interface MemberRow { id: string; workspace_id: string; auth_user_id: string | null; email: string; display_name: string; role: Role; status: MemberRecord['status']; approval_authorized: boolean; created_at: Date | string }
-const MEMBER_COLUMNS = 'm.id, m.workspace_id, m.auth_user_id, m.email, m.display_name, m.role, m.status, m.approval_authorized, m.created_at';
+interface MemberRow { id: string; workspace_id: string; organization_id: string; auth_user_id: string | null; email: string; display_name: string; role: Role; status: MemberRecord['status']; approval_authorized: boolean; created_at: Date | string }
+const MEMBER_COLUMNS = 'm.id, m.workspace_id, m.organization_id, m.auth_user_id, m.email, m.display_name, m.role, m.status, m.approval_authorized, m.created_at';
+function rowOrganization(value: string): OrganizationId {
+  const id = parseOrganizationId(value);
+  if (!id) throw new Error('invalid_organization_id');
+  return id;
+}
 const toMember = (row: MemberRow): MemberRecord => ({
-  id: row.id, workspaceId: row.workspace_id, authUserId: row.auth_user_id, email: row.email, displayName: row.display_name,
+  id: row.id, workspaceId: row.workspace_id, organizationId: rowOrganization(row.organization_id), authUserId: row.auth_user_id, email: row.email, displayName: row.display_name,
   role: row.role, status: row.status, approvalAuthorized: row.approval_authorized, createdAt: new Date(row.created_at),
 });
 
@@ -31,12 +38,28 @@ function auditDetails(value: unknown): Record<string, PlatformAuditDetail> {
   return out;
 }
 
-/** Every query is parameterized and pinned to the ThriveSource workspace by the server, never by input. */
+/**
+ * Every query is parameterized and pinned by the server, never by input, to the ThriveSource workspace AND to the
+ * store's organization context (Sprint 2.0B). All statements pass through organizationScopedSqlClient, which refuses any
+ * tenant-table statement without an organization predicate bound to that context, before the statement policy runs.
+ */
 export class PostgresAuthStore implements AuthStore {
-  constructor(private readonly sql: SqlClient) {}
+  private readonly sql: SqlClient;
+  private readonly org: OrganizationId;
+  constructor(sql: SqlClient, readonly context: OrganizationContext = THRIVESOURCE_SYSTEM_CONTEXT) {
+    this.sql = organizationScopedSqlClient(sql, context);
+    this.org = context.organizationId;
+  }
+
+  async organization(): Promise<Organization | null> {
+    const { rows } = await this.sql.query<{ id: string; slug: string; name: string; kind: Organization['kind']; status: Organization['status'] }>(
+      `SELECT o.id, o.slug, o.name, o.kind, o.status FROM organizations o WHERE o.id = $1`, [this.org]);
+    const row = rows[0];
+    return row ? { id: rowOrganization(row.id), slug: row.slug, name: row.name, kind: row.kind, status: row.status } : null;
+  }
 
   private async member(where: string, value: unknown): Promise<MemberRecord | null> {
-    const { rows } = await this.sql.query<MemberRow>(`SELECT ${MEMBER_COLUMNS} FROM workspace_members m WHERE m.workspace_id = $1 AND ${where} LIMIT 1`, [WORKSPACE_ID, value]);
+    const { rows } = await this.sql.query<MemberRow>(`SELECT ${MEMBER_COLUMNS} FROM workspace_members m WHERE m.workspace_id = $1 AND m.organization_id = $3 AND ${where} LIMIT 1`, [WORKSPACE_ID, value, this.org]);
     return rows[0] ? toMember(rows[0]) : null;
   }
   findMemberById(id: string) { return this.member('m.id = $2', id); }
@@ -44,15 +67,16 @@ export class PostgresAuthStore implements AuthStore {
   findMemberByAuthUserId(authUserId: string) { return this.member('m.auth_user_id = $2', authUserId); }
 
   async listMembers() {
-    const { rows } = await this.sql.query<MemberRow>(`SELECT ${MEMBER_COLUMNS} FROM workspace_members m WHERE m.workspace_id = $1 ORDER BY m.created_at, m.email`, [WORKSPACE_ID]);
+    const { rows } = await this.sql.query<MemberRow>(`SELECT ${MEMBER_COLUMNS} FROM workspace_members m WHERE m.workspace_id = $1 AND m.organization_id = $2 ORDER BY m.created_at, m.email`, [WORKSPACE_ID, this.org]);
     return rows.map(toMember);
   }
 
   async assignedContractorIds(managerMemberId: string) {
     const { rows } = await this.sql.query<{ id: string }>(
       `SELECT c.id FROM manager_assignments a JOIN workspace_members c ON c.id = a.contractor_member_id
-       WHERE a.workspace_id = $1 AND c.workspace_id = $1 AND a.manager_member_id = $2 AND c.role = 'contractor' AND c.status = 'active' ORDER BY c.id`,
-      [WORKSPACE_ID, managerMemberId]);
+       WHERE a.workspace_id = $1 AND c.workspace_id = $1 AND a.organization_id = $3 AND c.organization_id = $3
+         AND a.manager_member_id = $2 AND c.role = 'contractor' AND c.status = 'active' ORDER BY c.id`,
+      [WORKSPACE_ID, managerMemberId, this.org]);
     return rows.map(row => row.id);
   }
 
@@ -106,7 +130,9 @@ export class PostgresAuthStore implements AuthStore {
         [WORKSPACE_ID, input.authUserId, input.email.toLowerCase(), input.displayName, input.role, input.now, input.invitedBy]);
       const row = rows[0];
       if (!row) throw new Error('member_not_invitable');
-      await tx.query(`UPDATE workspace_invitations SET status = 'revoked' WHERE workspace_id = $1 AND member_id = $2 AND status = 'pending'`, [WORKSPACE_ID, row.id]);
+      // The member row (new or existing) must belong to this store's organization before anything is attached to it.
+      if (row.organization_id !== this.org) throw new Error('member_organization_mismatch');
+      await tx.query(`UPDATE workspace_invitations SET status = 'revoked' WHERE workspace_id = $1 AND organization_id = $3 AND member_id = $2 AND status = 'pending'`, [WORKSPACE_ID, row.id, this.org]);
       await tx.query(
         `INSERT INTO workspace_invitations (workspace_id, member_id, email, role, status, invited_by_member_id, created_at, expires_at)
          VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7)`,
@@ -116,7 +142,7 @@ export class PostgresAuthStore implements AuthStore {
   }
 
   async hasPendingInvitation(memberId: string, now: Date) {
-    const { rows } = await this.sql.query(`SELECT 1 FROM workspace_invitations WHERE workspace_id = $1 AND member_id = $2 AND status = 'pending' AND expires_at > $3`, [WORKSPACE_ID, memberId, now]);
+    const { rows } = await this.sql.query(`SELECT 1 FROM workspace_invitations WHERE workspace_id = $1 AND organization_id = $4 AND member_id = $2 AND status = 'pending' AND expires_at > $3`, [WORKSPACE_ID, memberId, now, this.org]);
     return rows.length > 0;
   }
 
@@ -126,15 +152,15 @@ export class PostgresAuthStore implements AuthStore {
       // workspace_members row first, then its invitations. Without it, accept (invitation → member) and disable
       // (member → invitation) on the same member could deadlock. FOR NO KEY UPDATE is the lock the activation UPDATE
       // below takes anyway, so foreign-key inserts that reference the member (sessions, audit) are not blocked.
-      const locked = await tx.query(`SELECT id FROM workspace_members WHERE workspace_id = $1 AND id = $2 FOR NO KEY UPDATE`, [WORKSPACE_ID, memberId]);
+      const locked = await tx.query(`SELECT id FROM workspace_members WHERE workspace_id = $1 AND organization_id = $3 AND id = $2 FOR NO KEY UPDATE`, [WORKSPACE_ID, memberId, this.org]);
       if (locked.rows.length !== 1) return false;
       const accepted = await tx.query(
         `UPDATE workspace_invitations SET status = 'accepted', accepted_at = $3
-         WHERE workspace_id = $1 AND member_id = $2 AND status = 'pending' AND expires_at > $3 RETURNING id`, [WORKSPACE_ID, memberId, now]);
+         WHERE workspace_id = $1 AND organization_id = $4 AND member_id = $2 AND status = 'pending' AND expires_at > $3 RETURNING id`, [WORKSPACE_ID, memberId, now, this.org]);
       if (accepted.rows.length !== 1) return false;
       const activated = await tx.query(
         `UPDATE workspace_members SET status = 'active', activated_at = $3
-         WHERE workspace_id = $1 AND id = $2 AND status = 'invited' AND auth_user_id IS NOT NULL RETURNING id`, [WORKSPACE_ID, memberId, now]);
+         WHERE workspace_id = $1 AND organization_id = $4 AND id = $2 AND status = 'invited' AND auth_user_id IS NOT NULL RETURNING id`, [WORKSPACE_ID, memberId, now, this.org]);
       if (activated.rows.length !== 1) throw new Error('member_not_activatable');
       return true;
     });
@@ -145,8 +171,8 @@ export class PostgresAuthStore implements AuthStore {
     return this.sql.transaction(async tx => {
       const { rows } = await tx.query(
         `UPDATE workspace_members SET status = 'disabled', disabled_at = $3, disabled_by = $4
-         WHERE workspace_id = $1 AND id = $2 AND status <> 'disabled' AND id <> $4 RETURNING id`, [WORKSPACE_ID, memberId, now, disabledBy]);
-      if (rows.length) await tx.query(`UPDATE workspace_invitations SET status = 'revoked' WHERE workspace_id = $1 AND member_id = $2 AND status = 'pending'`, [WORKSPACE_ID, memberId]);
+         WHERE workspace_id = $1 AND organization_id = $5 AND id = $2 AND status <> 'disabled' AND id <> $4 RETURNING id`, [WORKSPACE_ID, memberId, now, disabledBy, this.org]);
+      if (rows.length) await tx.query(`UPDATE workspace_invitations SET status = 'revoked' WHERE workspace_id = $1 AND organization_id = $3 AND member_id = $2 AND status = 'pending'`, [WORKSPACE_ID, memberId, this.org]);
       return rows.length === 1;
     });
   }
@@ -155,8 +181,8 @@ export class PostgresAuthStore implements AuthStore {
     // The guard trigger re-checks the actor's authority, so a bug here cannot grant Administrator access.
     const { rows } = await this.sql.query(
       `UPDATE workspace_members SET role = $3, role_changed_by = $5, role_changed_at = $6
-       WHERE workspace_id = $1 AND id = $2 AND role = $4 AND status = 'active' AND id <> $5 RETURNING id`,
-      [WORKSPACE_ID, input.memberId, input.role, input.expectedRole, input.changedBy, input.now]);
+       WHERE workspace_id = $1 AND organization_id = $7 AND id = $2 AND role = $4 AND status = 'active' AND id <> $5 RETURNING id`,
+      [WORKSPACE_ID, input.memberId, input.role, input.expectedRole, input.changedBy, input.now, this.org]);
     return rows.length === 1;
   }
 
@@ -169,24 +195,26 @@ export class PostgresAuthStore implements AuthStore {
   async resolveSession(tokenHash: string, now: Date): Promise<SessionRecord | null> {
     const { rows } = await this.sql.query<MemberRow & { session_id: string; last_seen_at: Date | string; absolute_expires_at: Date | string }>(
       `SELECT s.id AS session_id, s.last_seen_at, s.absolute_expires_at, ${MEMBER_COLUMNS}
-       FROM auth_sessions s JOIN workspace_members m ON m.id = s.member_id
+       FROM auth_sessions s JOIN workspace_members m ON m.id = s.member_id AND m.organization_id = s.organization_id
+         JOIN organizations o ON o.id = m.organization_id
        WHERE s.token_hash = $1 AND s.revoked_at IS NULL AND s.idle_expires_at > $2 AND s.absolute_expires_at > $2
-         AND m.workspace_id = $3 AND m.status = 'active' LIMIT 1`, [tokenHash, now, WORKSPACE_ID]);
+         AND m.workspace_id = $3 AND m.status = 'active'
+         AND s.organization_id = $4 AND m.organization_id = $4 AND o.id = $4 AND o.status = 'active' LIMIT 1`, [tokenHash, now, WORKSPACE_ID, this.org]);
     const row = rows[0];
     return row ? { sessionId: row.session_id, member: toMember(row), lastSeenAt: new Date(row.last_seen_at), absoluteExpiresAt: new Date(row.absolute_expires_at) } : null;
   }
 
   async touchSession(sessionId: string, now: Date, idleExpiresAt: Date) {
-    await this.sql.query(`UPDATE auth_sessions SET last_seen_at = $2, idle_expires_at = LEAST($3, absolute_expires_at) WHERE id = $1 AND revoked_at IS NULL`, [sessionId, now, idleExpiresAt]);
+    await this.sql.query(`UPDATE auth_sessions SET last_seen_at = $2, idle_expires_at = LEAST($3, absolute_expires_at) WHERE id = $1 AND organization_id = $4 AND revoked_at IS NULL`, [sessionId, now, idleExpiresAt, this.org]);
   }
 
   async revokeSession(tokenHash: string, reason: string, now: Date) {
-    const { rows } = await this.sql.query<{ member_id: string }>(`UPDATE auth_sessions SET revoked_at = $2, revoked_reason = $3, revoked_by_member_id = member_id WHERE token_hash = $1 AND revoked_at IS NULL RETURNING member_id`, [tokenHash, now, reason]);
+    const { rows } = await this.sql.query<{ member_id: string }>(`UPDATE auth_sessions SET revoked_at = $2, revoked_reason = $3, revoked_by_member_id = member_id WHERE token_hash = $1 AND organization_id = $4 AND revoked_at IS NULL RETURNING member_id`, [tokenHash, now, reason, this.org]);
     return rows[0]?.member_id ?? null;
   }
 
   async revokeMemberSessions(memberId: string, reason: string, now: Date, revokedBy: string) {
-    const { rows } = await this.sql.query(`UPDATE auth_sessions SET revoked_at = $2, revoked_reason = $3, revoked_by_member_id = $4 WHERE member_id = $1 AND revoked_at IS NULL RETURNING id`, [memberId, now, reason, revokedBy]);
+    const { rows } = await this.sql.query(`UPDATE auth_sessions SET revoked_at = $2, revoked_reason = $3, revoked_by_member_id = $4 WHERE member_id = $1 AND organization_id = $5 AND revoked_at IS NULL RETURNING id`, [memberId, now, reason, revokedBy, this.org]);
     return rows.length;
   }
 
