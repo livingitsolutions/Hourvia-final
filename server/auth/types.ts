@@ -1,4 +1,4 @@
-import type { Role } from '../../src/domain/permissions';
+import type { PlatformPrivilege, Role } from '../../src/domain/permissions';
 
 /** Minimal SQL surface shared by Netlify Database (pg Pool) and the embedded test Postgres. */
 export interface SqlClient {
@@ -37,15 +37,21 @@ export interface AuthStore {
   findMemberByAuthUserId(authUserId: string): Promise<MemberRecord | null>;
   listMembers(): Promise<MemberRecord[]>;
   assignedContractorIds(managerMemberId: string): Promise<string[]>;
+  /** Active platform privileges of a Supabase identity (read-only for the application). */
+  platformPrivileges(authUserId: string): Promise<PlatformPrivilege[]>;
   upsertInvitation(input: { email: string; role: Role; displayName: string; authUserId: string; invitedBy: string | null; now: Date; expiresAt: Date }): Promise<MemberRecord>;
   hasPendingInvitation(memberId: string, now: Date): Promise<boolean>;
   acceptInvitation(memberId: string, now: Date): Promise<boolean>;
   disableMember(memberId: string, disabledBy: string, now: Date): Promise<boolean>;
+  /** Changes an active member's role from expectedRole to role, recording the authorizing member. */
+  changeMemberRole(input: { memberId: string; expectedRole: Role; role: Role; changedBy: string; now: Date }): Promise<boolean>;
   createSession(input: { tokenHash: string; memberId: string; now: Date; idleExpiresAt: Date; absoluteExpiresAt: Date }): Promise<void>;
   resolveSession(tokenHash: string, now: Date): Promise<SessionRecord | null>;
   touchSession(sessionId: string, now: Date, idleExpiresAt: Date): Promise<void>;
+  /** Revokes one session; the acting member is the session's own member (logout). */
   revokeSession(tokenHash: string, reason: string, now: Date): Promise<string | null>;
-  revokeMemberSessions(memberId: string, reason: string, now: Date): Promise<number>;
+  /** Revokes every session of memberId, recording revokedBy as the acting member. */
+  revokeMemberSessions(memberId: string, reason: string, now: Date, revokedBy: string): Promise<number>;
   hitRateLimit(bucket: string, windowStart: Date): Promise<number>;
   audit(event: AuditEvent, now: Date): Promise<void>;
 }

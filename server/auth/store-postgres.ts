@@ -1,4 +1,4 @@
-import { WORKSPACE_ID, type Role } from '../../src/domain/permissions';
+import { WORKSPACE_ID, type PlatformPrivilege, type Role } from '../../src/domain/permissions';
 import type { AuditEvent, AuthStore, MemberRecord, SessionRecord, SqlClient } from './types';
 
 interface MemberRow { id: string; workspace_id: string; auth_user_id: string | null; email: string; display_name: string; role: Role; status: MemberRecord['status']; approval_authorized: boolean; created_at: Date | string }
@@ -33,15 +33,23 @@ export class PostgresAuthStore implements AuthStore {
     return rows.map(row => row.id);
   }
 
+  async platformPrivileges(authUserId: string) {
+    const { rows } = await this.sql.query<{ privilege: PlatformPrivilege }>(
+      `SELECT DISTINCT privilege FROM platform_privileges WHERE auth_user_id = $1 AND revoked_at IS NULL ORDER BY privilege`, [authUserId]);
+    return rows.map(row => row.privilege);
+  }
+
   upsertInvitation(input: { email: string; role: Role; displayName: string; authUserId: string; invitedBy: string | null; now: Date; expiresAt: Date }) {
     return this.sql.transaction(async tx => {
       const { rows } = await tx.query<MemberRow>(
         `INSERT INTO workspace_members AS m (workspace_id, auth_user_id, email, display_name, role, status, created_at)
          VALUES ($1, $2, $3, $4, $5, 'invited', $6)
-         ON CONFLICT (workspace_id, email) DO UPDATE SET role = EXCLUDED.role, display_name = EXCLUDED.display_name
+         ON CONFLICT (workspace_id, email) DO UPDATE SET role = EXCLUDED.role, display_name = EXCLUDED.display_name,
+           role_changed_by = CASE WHEN m.role IS DISTINCT FROM EXCLUDED.role THEN $7::uuid ELSE m.role_changed_by END,
+           role_changed_at = CASE WHEN m.role IS DISTINCT FROM EXCLUDED.role THEN $6 ELSE m.role_changed_at END
            WHERE m.status = 'invited' AND m.auth_user_id = EXCLUDED.auth_user_id
          RETURNING ${MEMBER_COLUMNS}`,
-        [WORKSPACE_ID, input.authUserId, input.email.toLowerCase(), input.displayName, input.role, input.now]);
+        [WORKSPACE_ID, input.authUserId, input.email.toLowerCase(), input.displayName, input.role, input.now, input.invitedBy]);
       const row = rows[0];
       if (!row) throw new Error('member_not_invitable');
       await tx.query(`UPDATE workspace_invitations SET status = 'revoked' WHERE workspace_id = $1 AND member_id = $2 AND status = 'pending'`, [WORKSPACE_ID, row.id]);
@@ -80,6 +88,15 @@ export class PostgresAuthStore implements AuthStore {
     return rows.length === 1;
   }
 
+  async changeMemberRole(input: { memberId: string; expectedRole: Role; role: Role; changedBy: string; now: Date }) {
+    // The guard trigger re-checks the actor's authority, so a bug here cannot grant Administrator access.
+    const { rows } = await this.sql.query(
+      `UPDATE workspace_members SET role = $3, role_changed_by = $5, role_changed_at = $6
+       WHERE workspace_id = $1 AND id = $2 AND role = $4 AND status = 'active' AND id <> $5 RETURNING id`,
+      [WORKSPACE_ID, input.memberId, input.role, input.expectedRole, input.changedBy, input.now]);
+    return rows.length === 1;
+  }
+
   async createSession(input: { tokenHash: string; memberId: string; now: Date; idleExpiresAt: Date; absoluteExpiresAt: Date }) {
     await this.sql.query(
       `INSERT INTO auth_sessions (token_hash, member_id, created_at, last_seen_at, idle_expires_at, absolute_expires_at) VALUES ($1, $2, $3, $3, $4, $5)`,
@@ -101,12 +118,12 @@ export class PostgresAuthStore implements AuthStore {
   }
 
   async revokeSession(tokenHash: string, reason: string, now: Date) {
-    const { rows } = await this.sql.query<{ member_id: string }>(`UPDATE auth_sessions SET revoked_at = $2, revoked_reason = $3 WHERE token_hash = $1 AND revoked_at IS NULL RETURNING member_id`, [tokenHash, now, reason]);
+    const { rows } = await this.sql.query<{ member_id: string }>(`UPDATE auth_sessions SET revoked_at = $2, revoked_reason = $3, revoked_by_member_id = member_id WHERE token_hash = $1 AND revoked_at IS NULL RETURNING member_id`, [tokenHash, now, reason]);
     return rows[0]?.member_id ?? null;
   }
 
-  async revokeMemberSessions(memberId: string, reason: string, now: Date) {
-    const { rows } = await this.sql.query(`UPDATE auth_sessions SET revoked_at = $2, revoked_reason = $3 WHERE member_id = $1 AND revoked_at IS NULL RETURNING id`, [memberId, now, reason]);
+  async revokeMemberSessions(memberId: string, reason: string, now: Date, revokedBy: string) {
+    const { rows } = await this.sql.query(`UPDATE auth_sessions SET revoked_at = $2, revoked_reason = $3, revoked_by_member_id = $4 WHERE member_id = $1 AND revoked_at IS NULL RETURNING id`, [memberId, now, reason, revokedBy]);
     return rows.length;
   }
 

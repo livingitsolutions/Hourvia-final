@@ -12,6 +12,20 @@ import { ProviderConflictError, type AuthConfig, type AuthDeps, type IdentityPro
 const migration = (name: string) => readFileSync(fileURLToPath(new URL(`../../../netlify/database/migrations/${name}`, import.meta.url)), 'utf8');
 export const SCHEMA_SQL = migration('20261103170000_create-auth-foundation.sql');
 export const ROLE_SQL = migration('20261103170100_restrict-auth-runtime-role.sql');
+// 20261104120000 is applied on the preview branch and stays immutable; 20261104130000 corrects it (forward-only).
+export const SUPER_ADMIN_SQL = migration('20261104120000_super-admin-role.sql');
+export const PLATFORM_SQL = migration('20261104130000_platform-privileges-correction.sql');
+const operation = (name: string) => readFileSync(fileURLToPath(new URL(`../../../db/operations/platform/${name}`, import.meta.url)), 'utf8');
+export const GRANT_PLATFORM_SQL = operation('grant-platform-super-admin.sql');
+export const REVOKE_PLATFORM_SQL = operation('revoke-platform-super-admin.sql');
+export const REINSTATE_MEMBER_SQL = operation('reinstate-disabled-member.sql');
+export const PLATFORM_EMAIL = 'livingitsolutions@gmail.com';
+/** Fills quoted operator placeholders exactly as the runbook instructs, e.g. { SUPABASE_AUTH_UID: '…' }. */
+export function fillOperatorSql(template: string, values: Record<string, string>) {
+  let sql = template;
+  for (const [key, value] of Object.entries({ APPROVAL_REF: 'CHG-2026-1104', ...values })) sql = sql.replaceAll(`'<${key}>'`, `'${value.replaceAll("'", "''")}'`);
+  return sql;
+}
 export const ORIGIN = 'https://hourvia.test';
 
 /**
@@ -87,11 +101,15 @@ export class FakeSupabase implements IdentityProvider {
   tokenFor(email: string, map: Map<string, string>) { return [...map].find(([, e]) => e === email)?.[0]; }
 }
 
-export async function createHarness(options: { schema?: boolean; restrictedRole?: boolean; config?: Partial<AuthConfig> } = {}) {
+export async function createHarness(options: { schema?: boolean; restrictedRole?: boolean; correction?: boolean; config?: Partial<AuthConfig> } = {}) {
   const pg = new PGlite();
   await asNetlifyOwner(pg);
   if (options.schema !== false) await applyMigration(pg, SCHEMA_SQL);
   if (options.schema !== false && options.restrictedRole !== false) await applyMigration(pg, ROLE_SQL);
+  if (options.schema !== false && options.restrictedRole !== false && options.correction !== false) {
+    await applyMigration(pg, SUPER_ADMIN_SQL);
+    await applyMigration(pg, PLATFORM_SQL);
+  }
   // Like production: every store statement runs under SET LOCAL ROLE hourvia_auth_runtime. Seeding via `pg` runs
   // as netlifydb_owner (non-superuser), like the reviewed bootstrap.
   const sql = roleScopedSqlClient(pgliteClient(pg));
@@ -119,7 +137,13 @@ export async function createHarness(options: { schema?: boolean; restrictedRole?
       [authUserId, email, email.split('@')[0], role, extra.status ?? 'active', extra.approval ?? false]);
     return { id: rows[0]!.id, email, password, authUserId };
   }
+  /** The Living IT Solutions Administrator, then the approved platform grant. The membership role stays workspace_admin. */
+  async function seedPlatformSuperAdmin(email = PLATFORM_EMAIL, password = 'correct horse battery') {
+    const member = await seedMember(email, 'workspace_admin', password);
+    await pg.exec(fillOperatorSql(GRANT_PLATFORM_SQL, { SUPABASE_AUTH_UID: member.authUserId, EXPECTED_MEMBER_ID: member.id }));
+    return member;
+  }
   async function login(email: string, password = 'correct horse battery', ip?: string) { return call('POST', '/api/auth/login', { body: { email, password }, ip }); }
-  return { pg, sql, provider, deps, config, clock, advance, sleeps, call, seedMember, login };
+  return { pg, sql, provider, deps, config, clock, advance, sleeps, call, seedMember, seedPlatformSuperAdmin, login };
 }
 export type Harness = Awaited<ReturnType<typeof createHarness>>;

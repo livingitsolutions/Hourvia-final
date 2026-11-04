@@ -52,11 +52,13 @@ describe('invitation-only access', () => {
     expect(login.status).toBe(200);
     expect(login.json!.principal).toMatchObject({ id, role: 'contractor', workspaceId: 'thrivesource', assignedContractorIds: [], approvalAuthorized: false });
   });
-  it('refuses invitations for the admin role, client-supplied workspace IDs and unknown fields', async () => {
+  it('refuses invitations for the admin and super admin roles, client-supplied workspace IDs and unknown fields', async () => {
     const admin = await adminSession();
-    for (const body of [{ email: 'x@t.test', role: 'workspace_admin' }, { email: 'x@t.test', role: 'contractor', workspaceId: 'other' }, { email: 'x@t.test', role: 'contractor', approvalAuthorized: true }]) {
+    for (const body of [{ email: 'x@t.test', role: 'super_admin' }, { email: 'x@t.test', role: 'contractor', workspaceId: 'other' }, { email: 'x@t.test', role: 'contractor', approvalAuthorized: true }]) {
       expect((await h.call('POST', '/api/admin/invitations', { cookie: admin.cookie, body })).status).toBe(400);
     }
+    // workspace_admin is a valid role, but only the Super Admin may grant it
+    expect((await h.call('POST', '/api/admin/invitations', { cookie: admin.cookie, body: { email: 'x@t.test', role: 'workspace_admin' } })).status).toBe(403);
     expect(h.provider.invited).toEqual([]);
   });
   it('blocks invitations from managers, contractors and anonymous callers', async () => {
@@ -267,7 +269,7 @@ describe('server-side RBAC, workspace isolation and cross-user access', () => {
     const c1 = await h.seedMember('c1@t.test', 'contractor'); const c2 = await h.seedMember('c2@t.test', 'contractor', 'x'.repeat(12), { status: 'disabled' });
     await h.pg.query(`INSERT INTO manager_assignments (workspace_id, manager_member_id, contractor_member_id) VALUES ('thrivesource', $1, $2), ('thrivesource', $1, $3)`, [m.id, c1.id, c2.id]);
     const res = await h.call('POST', '/api/auth/login', { body: { email: m.email, password: m.password } });
-    expect(res.json!.principal).toEqual({ id: m.id, name: 'm', role: 'workspace_manager', workspaceId: 'thrivesource', assignedContractorIds: [c1.id], approvalAuthorized: true });
+    expect(res.json!.principal).toEqual({ id: m.id, name: 'm', role: 'workspace_manager', workspaceId: 'thrivesource', assignedContractorIds: [c1.id], approvalAuthorized: true, platformPrivileges: [] });
     // extra client fields such as a role are rejected outright
     expect((await h.call('POST', '/api/auth/login', { body: { email: m.email, password: m.password, role: 'workspace_admin' } })).status).toBe(400);
   });
@@ -300,8 +302,11 @@ describe('audit trail', () => {
     await h.login('nobody@t.test', 'wrong');
     await h.call('POST', '/api/admin/invitations', { cookie: admin.cookie, body: { email: 'new@t.test', role: 'contractor' } });
     await h.call('POST', '/api/auth/logout', { cookie: admin.cookie });
-    const { rows } = await h.pg.query<{ event_type: string; outcome: string }>('SELECT event_type, outcome FROM auth_audit_events ORDER BY id');
+    const { rows } = await h.pg.query<{ event_type: string; outcome: string }>(`SELECT event_type, outcome FROM auth_audit_events WHERE NOT details ? 'source' ORDER BY id`);
     expect(rows).toEqual([{ event_type: 'login', outcome: 'success' }, { event_type: 'login', outcome: 'denied' }, { event_type: 'invitation_created', outcome: 'success' }, { event_type: 'logout', outcome: 'success' }]);
+    // the database itself records every membership row change, attributed to its source
+    const db = await h.pg.query<{ event_type: string; source: string }>(`SELECT event_type, details->>'source' AS source FROM auth_audit_events WHERE details ? 'source' ORDER BY id`);
+    expect(db.rows).toEqual([{ event_type: 'membership_created', source: 'operator_sql' }, { event_type: 'membership_created', source: 'application' }, { event_type: 'session_revocation', source: 'application' }]);
     const dump = JSON.stringify((await h.pg.query('SELECT * FROM auth_audit_events')).rows);
     expect(dump).not.toMatch(/nobody@t\.test|new@t\.test|203\.0\.113\.10/);
   });
@@ -380,7 +385,9 @@ describe('restricted database role (staged 002 proposal, enforced by real Postgr
     const m = await h.seedMember('m@t.test', 'workspace_manager');
     await expect(asRuntime(`UPDATE workspace_members SET approval_authorized = true`)).rejects.toThrow(/permission denied/);
     await expect(asRuntime(`UPDATE workspace_members SET auth_user_id = gen_random_uuid()`)).rejects.toThrow(/permission denied/);
-    await expect(asRuntime(`UPDATE workspace_members SET role = 'workspace_admin' WHERE id = '${m.id}'`)).rejects.toThrow(/only while invited/);
+    await expect(asRuntime(`UPDATE workspace_members SET role = 'workspace_admin' WHERE id = '${m.id}'`)).rejects.toThrow(/must record the authorizing member/);
+    await expect(asRuntime(`UPDATE workspace_members SET role = 'super_admin', role_changed_by = '${m.id}', role_changed_at = now() WHERE id = '${m.id}'`)).rejects.toThrow(/role_check|own role/);
+    await expect(asRuntime(`INSERT INTO platform_privileges (auth_user_id, privilege, grant_approval_ref) VALUES (gen_random_uuid(), 'platform_super_admin', 'x-123')`)).rejects.toThrow(/permission denied/);
     await expect(asRuntime(`INSERT INTO manager_assignments (workspace_id, manager_member_id, contractor_member_id) VALUES ('thrivesource', '${m.id}', '${m.id}')`)).rejects.toThrow(/permission denied/);
     await expect(asRuntime(`DELETE FROM auth_sessions`)).rejects.toThrow(/permission denied/);
     await expect(asRuntime(`DELETE FROM workspace_members`)).rejects.toThrow(/permission denied/);
