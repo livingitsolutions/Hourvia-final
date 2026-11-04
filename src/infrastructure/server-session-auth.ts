@@ -1,5 +1,6 @@
 import type { AcceptInvitationInput, AccountAccess, AdminInviteInput, Authentication, MemberRoleChangeInput, RecoveryCompleteInput } from '../domain/contracts';
 import type { Principal } from '../domain/permissions';
+import type { PlatformAuditPage, PlatformOverview } from '../domain/platform';
 
 /**
  * Browser adapter for Hourvia's server-managed session. It never sees a provider token, refresh token, or
@@ -52,3 +53,18 @@ export function createWorkspaceAdminApi(fetcher: Fetch = (...args) => fetch(...a
 }
 export type WorkspaceAdminApi = ReturnType<typeof createWorkspaceAdminApi>;
 export const serverSessionAuth = createServerSessionAuth();
+
+/** Read-only Platform Administration client. Every call is re-authorized by the server and the database. */
+export function createPlatformApi(fetcher: Fetch = (...args) => fetch(...args)) {
+  return {
+    async overview() { return (await call<{ overview: PlatformOverview }>(fetcher, '/api/platform/overview')).overview; },
+    async audit(page: { before?: number | null; limit?: number } = {}) {
+      const query = new URLSearchParams();
+      if (page.limit !== undefined) query.set('limit', String(page.limit));
+      if (page.before != null) query.set('before', String(page.before));
+      const qs = query.toString();
+      return call<PlatformAuditPage>(fetcher, `/api/platform/audit${qs ? `?${qs}` : ''}`);
+    },
+  };
+}
+export type PlatformApi = ReturnType<typeof createPlatformApi>;

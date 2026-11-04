@@ -1,4 +1,5 @@
 import type { PlatformPrivilege, Role } from '../../src/domain/permissions';
+import type { PlatformAuditPage, PlatformOverview } from '../../src/domain/platform';
 
 /** Minimal SQL surface shared by Netlify Database (pg Pool) and the embedded test Postgres. */
 export interface SqlClient {
@@ -39,6 +40,12 @@ export interface AuthStore {
   assignedContractorIds(managerMemberId: string): Promise<string[]>;
   /** Active platform privileges of a Supabase identity (read-only for the application). */
   platformPrivileges(authUserId: string): Promise<PlatformPrivilege[]>;
+  /**
+   * Platform console reads (Sprint 1.8). Authorized inside the database from the caller's session token hash;
+   * null means the database refused (not the active, designated holder, or the session is no longer valid).
+   */
+  platformOverview(sessionTokenHash: string): Promise<PlatformOverview | null>;
+  platformAuditPage(sessionTokenHash: string, page: { beforeId: number | null; limit: number }): Promise<PlatformAuditPage | null>;
   upsertInvitation(input: { email: string; role: Role; displayName: string; authUserId: string; invitedBy: string | null; now: Date; expiresAt: Date }): Promise<MemberRecord>;
   hasPendingInvitation(memberId: string, now: Date): Promise<boolean>;
   acceptInvitation(memberId: string, now: Date): Promise<boolean>;

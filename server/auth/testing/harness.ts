@@ -15,6 +15,8 @@ export const ROLE_SQL = migration('20261103170100_restrict-auth-runtime-role.sql
 // 20261104120000 is applied on the preview branch and stays immutable; 20261104130000 corrects it (forward-only).
 export const SUPER_ADMIN_SQL = migration('20261104120000_super-admin-role.sql');
 export const PLATFORM_SQL = migration('20261104130000_platform-privileges-correction.sql');
+// Sprint 1.8 Platform Administration foundation (forward-only, functions only).
+export const PLATFORM_ADMIN_SQL = migration('20261104150000_platform-administration-read-access.sql');
 const operation = (name: string) => readFileSync(fileURLToPath(new URL(`../../../db/operations/platform/${name}`, import.meta.url)), 'utf8');
 export const GRANT_PLATFORM_SQL = operation('grant-platform-super-admin.sql');
 export const REVOKE_PLATFORM_SQL = operation('revoke-platform-super-admin.sql');
@@ -101,7 +103,7 @@ export class FakeSupabase implements IdentityProvider {
   tokenFor(email: string, map: Map<string, string>) { return [...map].find(([, e]) => e === email)?.[0]; }
 }
 
-export async function createHarness(options: { schema?: boolean; restrictedRole?: boolean; correction?: boolean; config?: Partial<AuthConfig> } = {}) {
+export async function createHarness(options: { schema?: boolean; restrictedRole?: boolean; correction?: boolean; platformAdmin?: boolean; config?: Partial<AuthConfig>; now?: Date } = {}) {
   const pg = new PGlite();
   await asNetlifyOwner(pg);
   if (options.schema !== false) await applyMigration(pg, SCHEMA_SQL);
@@ -109,12 +111,15 @@ export async function createHarness(options: { schema?: boolean; restrictedRole?
   if (options.schema !== false && options.restrictedRole !== false && options.correction !== false) {
     await applyMigration(pg, SUPER_ADMIN_SQL);
     await applyMigration(pg, PLATFORM_SQL);
+    if (options.platformAdmin !== false) await applyMigration(pg, PLATFORM_ADMIN_SQL);
   }
   // Like production: every store statement runs under SET LOCAL ROLE hourvia_auth_runtime. Seeding via `pg` runs
   // as netlifydb_owner (non-superuser), like the reviewed bootstrap.
   const sql = roleScopedSqlClient(pgliteClient(pg));
   const provider = new FakeSupabase();
-  const clock = { now: new Date('2026-11-03T10:00:00Z') };
+  // The platform console functions check session expiry against the database clock (now()), so platform tests start
+  // the application clock at real time with { now: new Date() }.
+  const clock = { now: options.now ?? new Date('2026-11-03T10:00:00Z') };
   const sleeps: number[] = [];
   const config: AuthConfig = { hashKey: 'k'.repeat(48), appOrigin: ORIGIN, emailDeliveryAuthorized: true, idleTimeoutSeconds: 1800, absoluteTimeoutSeconds: 43200, invitationTtlSeconds: 7 * 86400, recoveryMinimumMs: 750, smokeTestEmails: null, ...options.config };
   const deps: AuthDeps = { store: new PostgresAuthStore(sql), provider, config, now: () => new Date(clock.now), sleep: async ms => { sleeps.push(ms); } };

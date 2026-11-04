@@ -1,4 +1,5 @@
 import { WORKSPACE_ID, type PlatformPrivilege, type Role } from '../../src/domain/permissions';
+import { isPlatformPrivilege, type PlatformAuditDetail, type PlatformAuditEvent, type PlatformAuditPage, type PlatformOverview } from '../../src/domain/platform';
 import type { AuditEvent, AuthStore, MemberRecord, SessionRecord, SqlClient } from './types';
 
 interface MemberRow { id: string; workspace_id: string; auth_user_id: string | null; email: string; display_name: string; role: Role; status: MemberRecord['status']; approval_authorized: boolean; created_at: Date | string }
@@ -7,6 +8,28 @@ const toMember = (row: MemberRow): MemberRecord => ({
   id: row.id, workspaceId: row.workspace_id, authUserId: row.auth_user_id, email: row.email, displayName: row.display_name,
   role: row.role, status: row.status, approvalAuthorized: row.approval_authorized, createdAt: new Date(row.created_at),
 });
+
+interface OverviewJson {
+  grant: { privilege: string; granted_at: string; approval_ref: string } | null; designated_at: string | null;
+  grant_history?: { granted?: number; revoked?: number };
+  organizations?: ({ id: string; members?: Record<string, number>; active_roles?: Record<string, number> } | null)[];
+  audit?: { events?: number; last_event_at?: string | null };
+}
+interface AuditPageJson { events: { id: number; occurred_at: string; event_type: string; outcome: string; subject_is_holder: boolean; subject_suffix: string | null; details: unknown }[]; has_more: boolean }
+const num = (value: unknown) => { const n = Number(value ?? 0); return Number.isFinite(n) ? n : 0; };
+const iso = (value: unknown) => (value == null ? null : new Date(String(value)).toISOString());
+/** Only known, scalar audit detail keys leave the server; anything else in the jsonb is dropped. */
+const AUDIT_DETAIL_KEYS = ['privilege', 'grant_id', 'approval_ref', 'reason', 'source', 'before_id', 'limit', 'returned'] as const;
+function auditDetails(value: unknown): Record<string, PlatformAuditDetail> {
+  const out: Record<string, PlatformAuditDetail> = {};
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return out;
+  for (const key of AUDIT_DETAIL_KEYS) {
+    const v = (value as Record<string, unknown>)[key];
+    if (v === null || typeof v === 'number' || typeof v === 'boolean') out[key] = v;
+    else if (typeof v === 'string') out[key] = v.slice(0, 120);
+  }
+  return out;
+}
 
 /** Every query is parameterized and pinned to the ThriveSource workspace by the server, never by input. */
 export class PostgresAuthStore implements AuthStore {
@@ -36,7 +59,38 @@ export class PostgresAuthStore implements AuthStore {
   async platformPrivileges(authUserId: string) {
     const { rows } = await this.sql.query<{ privilege: PlatformPrivilege }>(
       `SELECT DISTINCT privilege FROM platform_privileges WHERE auth_user_id = $1 AND revoked_at IS NULL ORDER BY privilege`, [authUserId]);
-    return rows.map(row => row.privilege);
+    // Allowlist on top of the database CHECK: an unknown value can never become a privilege in the principal.
+    return rows.map(row => row.privilege).filter(isPlatformPrivilege);
+  }
+
+  async platformOverview(sessionTokenHash: string): Promise<PlatformOverview | null> {
+    const { rows } = await this.sql.query<{ o: OverviewJson | null }>(`SELECT hourvia_platform_overview($1) AS o`, [sessionTokenHash]);
+    const o = rows[0]?.o;
+    if (!o || !o.grant || !isPlatformPrivilege(o.grant.privilege)) return null;
+    return {
+      grant: { privilege: o.grant.privilege, grantedAt: iso(o.grant.granted_at)!, approvalRef: String(o.grant.approval_ref) },
+      designatedAt: iso(o.designated_at),
+      grantHistory: { granted: num(o.grant_history?.granted), revoked: num(o.grant_history?.revoked) },
+      organizations: (o.organizations ?? []).flatMap(org => org ? [org] : []).map(org => ({
+        id: String(org.id),
+        members: { active: num(org.members?.active), invited: num(org.members?.invited), disabled: num(org.members?.disabled) },
+        activeRoles: { workspace_admin: num(org.active_roles?.workspace_admin), workspace_manager: num(org.active_roles?.workspace_manager), contractor: num(org.active_roles?.contractor) },
+      })),
+      audit: { events: num(o.audit?.events), lastEventAt: iso(o.audit?.last_event_at) },
+    };
+  }
+
+  async platformAuditPage(sessionTokenHash: string, page: { beforeId: number | null; limit: number }): Promise<PlatformAuditPage | null> {
+    const { rows } = await this.sql.query<{ p: AuditPageJson | null }>(`SELECT hourvia_platform_audit_page($1, $2::bigint, $3::integer) AS p`, [sessionTokenHash, page.beforeId, page.limit]);
+    const p = rows[0]?.p;
+    if (!p || !Array.isArray(p.events)) return null;
+    const events: PlatformAuditEvent[] = p.events.map(e => ({
+      id: num(e.id), occurredAt: iso(e.occurred_at)!, eventType: String(e.event_type),
+      outcome: e.outcome === 'success' || e.outcome === 'denied' ? e.outcome : 'error',
+      subjectIsHolder: e.subject_is_holder === true, subjectSuffix: typeof e.subject_suffix === 'string' ? e.subject_suffix : null,
+      details: auditDetails(e.details),
+    }));
+    return { events, hasMore: p.has_more === true, nextBefore: p.has_more === true && events.length ? events[events.length - 1]!.id : null };
   }
 
   upsertInvitation(input: { email: string; role: Role; displayName: string; authUserId: string; invitedBy: string | null; now: Date; expiresAt: Date }) {

@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { authorization, canAssignRole, canManageMember, hasPlatformPrivilege, WORKSPACE_ID, type Principal } from '../../src/domain/permissions';
 import { acceptInvitationSchema, adminInviteSchema, loginSchema, memberRoleChangeSchema, recoveryCompleteSchema, recoveryRequestSchema } from '../../src/domain/contracts';
+import { PLATFORM_AUDIT_DEFAULT_LIMIT, PLATFORM_AUDIT_MAX_LIMIT, platformAuthorization, type PlatformPermission } from '../../src/domain/platform';
 import { hmacHex, isSessionTokenShape, newSessionToken, sha256Hex } from './crypto';
 import { ProviderConflictError, type AuditEvent, type AuthDeps, type MemberRecord } from './types';
 
@@ -16,6 +17,7 @@ export const messages = {
   unauthenticated: 'Your session has ended. Sign in again.',
   forbidden: 'Your workspace role does not allow this action.',
   privilegeDenied: 'Your workspace role cannot grant or change that access.',
+  platformForbidden: 'Platform Administration is available only to the Platform Super Admin.',
 } as const;
 
 const ok = (body: unknown, status = 200): Outcome => ({ status, body });
@@ -357,4 +359,51 @@ export class AuthService {
     await this.audit({ eventType: 'sessions_revoked', outcome: 'success', actorMemberId: admin.id, subjectMemberId: memberId, details: { sessions_revoked: revoked, target_role: target.role, authority: target.id === admin.id ? 'self' : this.authority(admin, target.role) } });
     return ok({ sessionsRevoked: revoked });
   }
+
+  // ---------- Platform Administration (Sprint 1.8): read-only, platform plane only ----------
+  /**
+   * Platform guard. Authorizes from the platform plane only (platformAuthorization never reads the organization role
+   * or workspace permissions), then the database re-authorizes from the session itself inside hourvia_platform_*.
+   * Unauthenticated → 401. Authenticated without the platform permission → 403, audited in auth_audit_events.
+   */
+  private async platform(meta: RequestMeta, permission: PlatformPermission): Promise<{ principal: Principal; tokenHash: string } | Outcome> {
+    const principal = await this.authenticate(meta.sessionToken);
+    if (!principal || !meta.sessionToken) return { ...fail(401, 'unauthenticated', messages.unauthenticated), cookie: meta.sessionToken ? 'clear' : undefined };
+    if (!platformAuthorization.can(principal, permission)) return this.platformDenied(principal, meta, permission, 'no_platform_privilege');
+    return { principal, tokenHash: sha256Hex(meta.sessionToken) };
+  }
+  private async platformDenied(principal: Principal, meta: RequestMeta, permission: PlatformPermission, reason: string): Promise<Outcome> {
+    await this.audit({ eventType: 'platform_access', outcome: 'denied', actorMemberId: principal.id, ipHmac: this.hmac('ip', meta.ip), details: { permission, reason } });
+    return fail(403, 'platform_forbidden', messages.platformForbidden);
+  }
+
+  async platformOverview(meta: RequestMeta): Promise<Outcome> {
+    const guard = await this.platform(meta, 'platform.overview.read');
+    if ('status' in guard) return guard;
+    const overview = await this.deps.store.platformOverview(guard.tokenHash);
+    if (!overview) return this.platformDenied(guard.principal, meta, 'platform.overview.read', 'database_denied');
+    return ok({ overview });
+  }
+
+  async platformAudit(meta: RequestMeta, query: URLSearchParams): Promise<Outcome> {
+    const guard = await this.platform(meta, 'platform.audit.read');
+    if ('status' in guard) return guard;
+    const page = parseAuditQuery(query);
+    if ('error' in page) return { status: 400, body: { error: 'invalid_request', message: page.error } };
+    const result = await this.deps.store.platformAuditPage(guard.tokenHash, page);
+    if (!result) return this.platformDenied(guard.principal, meta, 'platform.audit.read', 'database_denied');
+    return ok(result);
+  }
+}
+
+/** Accepts only ?limit=1..100 and ?before=<positive id>, each at most once. Validated after authorization. */
+function parseAuditQuery(query: URLSearchParams): { beforeId: number | null; limit: number } | { error: string } {
+  const keys = [...query.keys()];
+  if (keys.some(key => key !== 'limit' && key !== 'before') || new Set(keys).size !== keys.length) return { error: 'Only the limit and before parameters are accepted.' };
+  const limitText = query.get('limit'); const beforeText = query.get('before');
+  if (limitText !== null && !/^[1-9]\d{0,2}$/.test(limitText)) return { error: `limit must be between 1 and ${PLATFORM_AUDIT_MAX_LIMIT}.` };
+  const limit = limitText === null ? PLATFORM_AUDIT_DEFAULT_LIMIT : Number(limitText);
+  if (limit > PLATFORM_AUDIT_MAX_LIMIT) return { error: `limit must be between 1 and ${PLATFORM_AUDIT_MAX_LIMIT}.` };
+  if (beforeText !== null && !/^[1-9]\d{0,14}$/.test(beforeText)) return { error: 'before must be a positive event id.' };
+  return { beforeId: beforeText === null ? null : Number(beforeText), limit };
 }
