@@ -13,6 +13,7 @@ import { AUTH_DB_ROLE, assertAllowedStatement, roleScopedSqlClient, SqlStatement
 import { PostgresAuthStore } from './store-postgres';
 import { ORIGIN, ROLE_SQL, SCHEMA_SQL, applyMigration, asNetlifyOwner, createHarness, type Harness } from './testing/harness';
 import type { SqlClient } from './types';
+import { THRIVESOURCE_ORGANIZATION_ID } from '../../src/domain/organization';
 
 describe('G-1: store statement policy', () => {
   const rejected = [
@@ -80,7 +81,7 @@ describe('G-1: store statement policy', () => {
   it('every statement PostgresAuthStore can issue passes the policy, and no input value ever reaches SQL text', async () => {
     const issued: { text: string; params: unknown[] }[] = [];
     const recorder: SqlClient = {
-      query: async <T>(text: string, params: unknown[] = []) => { issued.push({ text, params }); return { rows: [{ id: 'x', hits: 1, o: null, p: null } as T] }; },
+      query: async <T>(text: string, params: unknown[] = []) => { issued.push({ text, params }); return { rows: [{ id: 'x', organization_id: THRIVESOURCE_ORGANIZATION_ID, hits: 1, o: null, p: null } as T] }; },
       transaction: async fn => fn(recorder),
     };
     const store = new PostgresAuthStore(statementGuardedSqlClient(recorder));
@@ -342,7 +343,7 @@ describe('G-3b (Sprint 1.9C.1, gate finding F-3): one lock order for every membe
   it('acceptInvitation, disableMember and upsertInvitation lock workspace_members before workspace_invitations', async () => {
     const issued: string[] = [];
     const recorder: SqlClient = {
-      query: async <T>(text: string) => { issued.push(text.trim().replace(/\s+/g, ' ')); return { rows: [{ id: 'x' } as T] }; },
+      query: async <T>(text: string) => { issued.push(text.trim().replace(/\s+/g, ' ')); return { rows: [{ id: 'x', organization_id: THRIVESOURCE_ORGANIZATION_ID } as T] }; },
       transaction: async fn => fn(recorder),
     };
     const store = new PostgresAuthStore(statementGuardedSqlClient(recorder));
