@@ -241,7 +241,10 @@ describe('platform privilege through the API', () => {
   it('grants no organization authority to a holder who is not an Administrator of that organization', async () => {
     // Defence in depth: even if the identity held the privilege while being only a Manager, it would manage nobody.
     const lis = await h.seedMember(PLATFORM_EMAIL, 'workspace_manager');
-    await grant(lis.authUserId, lis.id); // eligibility is identity-based, independent of the organization role
+    await expect(grant(lis.authUserId, lis.id)).rejects.toThrow(/not workspace_admin/); // the approved procedure refuses
+    // Direct owner SQL, which the table triggers still allow for the verified identity, is the only way to reach this state.
+    await h.pg.query(`INSERT INTO platform_super_admin_designation (auth_user_id, approval_ref) VALUES ($1, 'x-123')`, [lis.authUserId]);
+    await h.pg.query(`INSERT INTO platform_privileges (auth_user_id, privilege, grant_approval_ref) VALUES ($1, 'platform_super_admin', 'x-123')`, [lis.authUserId]);
     const { cookie } = await h.login(lis.email);
     expect((await h.call('GET', '/api/auth/session', { cookie })).json!.principal).toMatchObject({ role: 'workspace_manager', platformPrivileges: ['platform_super_admin'] });
     expect((await h.call('GET', '/api/admin/members', { cookie })).status).toBe(403);
@@ -389,5 +392,143 @@ describe('existing bootstrap, login and invitation flows', () => {
     await h.pg.query(`INSERT INTO workspace_invitations (workspace_id, member_id, email, role, status, expires_at, accepted_at) VALUES ('thrivesource', $1, 'i@t.test', 'contractor', 'accepted', now() + interval '1 day', now())`, [i.id]);
     await h.pg.query(`UPDATE workspace_members SET role = 'workspace_admin' WHERE id = $1`, [i.id]); // owner edit while invited
     await expect(h.sql.query(`UPDATE workspace_members SET status = 'active', activated_at = now() WHERE id = $1`, [i.id])).rejects.toThrow(/accepted invitation for the same role/);
+  });
+});
+
+describe('AP-PSA-GRANT hardening: Administrator role, row lock, guards and idempotency', () => {
+  const OTHER_UID = '99999999-8888-4777-8666-555555555555';
+  const state = async () => ({
+    designation: (await h.pg.query(`SELECT * FROM platform_super_admin_designation`)).rows,
+    privileges: (await h.pg.query(`SELECT * FROM platform_privileges ORDER BY granted_at, id`)).rows,
+    platformAudit: (await h.pg.query(`SELECT * FROM platform_audit_events ORDER BY id`)).rows,
+    authAudit: (await h.pg.query(`SELECT * FROM auth_audit_events ORDER BY id`)).rows,
+    members: (await h.pg.query(`SELECT * FROM workspace_members ORDER BY id`)).rows,
+  });
+  const nothingWritten = async (before: Awaited<ReturnType<typeof state>>) => expect(await state()).toEqual(before);
+  /** Test fixture only: plants a designation the guarded paths can never write (stands in for a reviewed forward migration). */
+  async function plantDesignation(uid: string) {
+    await h.pg.transaction(async tx => {
+      await tx.exec(`ALTER TABLE platform_super_admin_designation DISABLE TRIGGER platform_super_admin_designation_guard`);
+      await tx.query(`INSERT INTO platform_super_admin_designation (auth_user_id, approval_ref) VALUES ($1, 'MIG-2026-0001')`, [uid]);
+      await tx.exec(`ALTER TABLE platform_super_admin_designation ENABLE TRIGGER platform_super_admin_designation_guard`);
+    });
+  }
+
+  it('rejects a Living IT Solutions membership that is not an Administrator, writing nothing', async () => {
+    for (const role of ['workspace_manager', 'contractor'] as const) {
+      h = await createHarness();
+      const lis = await h.seedMember(PLATFORM_EMAIL, role);
+      const before = await state();
+      await expect(grant(lis.authUserId, lis.id)).rejects.toThrow(new RegExp(`grant_guard: the membership role is ${role}, not workspace_admin`));
+      await nothingWritten(before);
+    }
+  });
+
+  it('rejects an incorrect UID or member ID, in any combination, writing nothing', async () => {
+    const lis = await h.seedMember(PLATFORM_EMAIL, 'workspace_admin');
+    const other = await h.seedMember('other.admin@t.test', 'workspace_admin');
+    const before = await state();
+    for (const [uid, member] of [
+      [OTHER_UID, lis.id],                 // unknown UID, right member
+      [lis.authUserId, OTHER_UID],         // right UID, unknown member
+      [other.authUserId, lis.id],          // another Administrator's UID
+      [lis.authUserId, other.id],          // another Administrator's member id
+      [other.authUserId, other.id],        // a consistent pair that is not the designated mailbox
+      [lis.id, lis.authUserId],            // swapped
+    ]) {
+      await expect(grant(uid!, member!)).rejects.toThrow(/grant_guard: UID and member id do not match/);
+    }
+    await expect(grant('not-a-uuid', lis.id)).rejects.toThrow(/grant_input/);
+    await expect(grant(lis.authUserId, `${lis.id}x`)).rejects.toThrow(/grant_input/);
+    await nothingWritten(before);
+  });
+
+  it('rejects a grant when an existing designation names a different identity, writing nothing', async () => {
+    const lis = await h.seedMember(PLATFORM_EMAIL, 'workspace_admin');
+    await plantDesignation(OTHER_UID);
+    const before = await state();
+    await expect(grant(lis.authUserId, lis.id)).rejects.toThrow(/grant_guard: a different identity is designated/);
+    await nothingWritten(before);
+    expect(await activeGrants()).toBe(0);
+  });
+
+  it('is idempotent while the grant is active: a re-run, even under another approval, writes nothing', async () => {
+    const lis = await h.seedMember(PLATFORM_EMAIL, 'workspace_admin');
+    await grant(lis.authUserId, lis.id);
+    const before = await state();
+    expect(before.privileges).toHaveLength(1);
+    await grant(lis.authUserId, lis.id);
+    await grant(lis.authUserId, lis.id, 'CHG-2026-9999');
+    await nothingWritten(before);
+    // The idempotent path still sits behind the identity guards.
+    await expect(grant(OTHER_UID, lis.id)).rejects.toThrow(/do not match/);
+    await nothingWritten(before);
+  });
+
+  it('holds a FOR UPDATE row lock on the membership, after the platform table locks, until the transaction ends', async () => {
+    const lis = await h.seedMember(PLATFORM_EMAIL, 'workspace_admin');
+    for (const run of ['grant', 'idempotent re-run'] as const) {
+      const held = await h.pg.transaction(async tx => {
+        await tx.exec(fillOperatorSql(GRANT_PLATFORM_SQL, { SUPABASE_AUTH_UID: lis.authUserId, EXPECTED_MEMBER_ID: lis.id }));
+        const locks = (await tx.query<{ rel: string; mode: string }>(
+          `SELECT c.relname AS rel, l.mode FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
+            WHERE l.pid = pg_backend_pid() AND l.granted AND c.relname IN ('workspace_members', 'platform_privileges', 'platform_super_admin_designation')`)).rows;
+        const row = (await tx.query<{ locked_by_me: boolean }>(
+          `SELECT xmax::text = (pg_current_xact_id()::text) AS locked_by_me FROM workspace_members WHERE id = $1`, [lis.id])).rows[0]!;
+        return { locks, row, run };
+      });
+      expect(held.row.locked_by_me).toBe(true); // tuple locked by this transaction: a concurrent writer must wait
+      expect(held.locks).toEqual(expect.arrayContaining([
+        { rel: 'workspace_members', mode: 'RowShareLock' },
+        { rel: 'platform_privileges', mode: 'ShareRowExclusiveLock' },
+        { rel: 'platform_super_admin_designation', mode: 'ShareRowExclusiveLock' },
+      ]));
+    }
+    // Lock order: platform tables, then the membership row, then every guard that reads the membership.
+    const sql = GRANT_PLATFORM_SQL;
+    const tableLock = sql.indexOf('LOCK TABLE platform_super_admin_designation, platform_privileges IN SHARE ROW EXCLUSIVE MODE');
+    const rowLock = sql.search(/FROM workspace_members\s+WHERE workspace_id = 'thrivesource' AND email = 'livingitsolutions@gmail\.com'\s+FOR UPDATE;/);
+    expect(tableLock).toBeGreaterThan(sql.indexOf("set_config('lock_timeout'"));
+    expect(rowLock).toBeGreaterThan(tableLock);
+    expect(sql.indexOf('grant_guard')).toBeGreaterThan(rowLock);
+    expect((sql.replace(/--.*$/gm, '').match(/FOR UPDATE|LOCK TABLE/g) ?? []).length).toBe(2); // no other lock statements
+    // Consistent with the other procedures: revoke locks platform_privileges first; reinstate never touches platform tables.
+    expect(REVOKE_PLATFORM_SQL.indexOf('LOCK TABLE platform_privileges IN SHARE ROW EXCLUSIVE MODE')).toBeLessThan(REVOKE_PLATFORM_SQL.indexOf('UPDATE auth_sessions'));
+    expect(REVOKE_PLATFORM_SQL).not.toMatch(/LOCK TABLE workspace_members|FOR UPDATE/);
+    expect(REINSTATE_MEMBER_SQL).not.toMatch(/platform_privileges|platform_super_admin_designation/);
+  });
+
+  it('rolls back atomically, audit rows included, when the membership is modified while the grant is in progress', async () => {
+    const lis = await h.seedMember(PLATFORM_EMAIL, 'workspace_admin');
+    // PGlite is single-connection, so the concurrent writer is simulated inside the grant's own transaction: a
+    // test-only trigger disables the membership right after the privilege row is written. The self-check must catch it.
+    await h.pg.exec(`
+      CREATE FUNCTION test_concurrent_member_change() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        UPDATE workspace_members SET status = 'disabled', disabled_at = now() WHERE auth_user_id = NEW.auth_user_id;
+        RETURN NULL;
+      END $$;
+      CREATE TRIGGER test_concurrent_member_change AFTER INSERT ON platform_privileges FOR EACH ROW EXECUTE FUNCTION test_concurrent_member_change();`);
+    const before = await state();
+    await expect(grant(lis.authUserId, lis.id)).rejects.toThrow(/grant_selfcheck: unexpected result; rolled back/);
+    await nothingWritten(before); // no designation, no grant, no platform or membership audit row, membership still active
+    expect(await memberRow(lis.id)).toMatchObject({ role: 'workspace_admin', status: 'active' });
+
+    // A modification committed before the run is re-read under the lock and refused.
+    await h.pg.exec(`DROP TRIGGER test_concurrent_member_change ON platform_privileges; DROP FUNCTION test_concurrent_member_change();`);
+    await h.pg.query(`UPDATE workspace_members SET status = 'disabled', disabled_at = now() WHERE id = $1`, [lis.id]);
+    const disabled = await state();
+    await expect(grant(lis.authUserId, lis.id)).rejects.toThrow(/grant_guard: the membership is disabled/);
+    await nothingWritten(disabled);
+  });
+
+  it('keeps the database audit triggers enabled and records exactly one designation and one grant event', async () => {
+    const lis = await h.seedMember(PLATFORM_EMAIL, 'workspace_admin');
+    await grant(lis.authUserId, lis.id, 'CHG-2026-1234');
+    expect(await platformAudit()).toEqual([
+      { event_type: 'platform_designation_set', subject_auth_user_id: lis.authUserId, details: { approval_ref: 'CHG-2026-1234', source: 'operator_sql' } },
+      { event_type: 'platform_privilege_granted', subject_auth_user_id: lis.authUserId, details: expect.objectContaining({ approval_ref: 'CHG-2026-1234', privilege: 'platform_super_admin', source: 'operator_sql' }) },
+    ]);
+    expect(GRANT_PLATFORM_SQL).not.toMatch(/DISABLE TRIGGER|session_replication_role|ALTER TABLE/i);
   });
 });
