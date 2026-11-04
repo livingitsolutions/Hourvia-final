@@ -519,15 +519,15 @@ describe('static tenant predicates', () => {
     await client.query(`SELECT m.id FROM workspace_members m WHERE m.organization_id = $1`, [TS]);
     expect(reached).toBe(1);
   });
-  it('source scan: the store is always constructed over the scoped client, and the runtime wiring is unchanged', () => {
+  it('source scan: the store is always constructed over the scoped client, and runtime retains role and statement guards', () => {
     const src = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
     expect(src('./store-postgres.ts')).toMatch(/this\.sql = organizationScopedSqlClient\(sql, context\);/);
     expect(src('./store-postgres.ts').match(/this\.sql\s*=/g)).toHaveLength(1);
-    expect(src('./runtime.ts')).toMatch(/new PostgresAuthStore\(statementGuardedSqlClient\(roleScopedSqlClient\(poolSqlClient\(platformPool\(\)\)\)\)\)/);
+    expect(src('./runtime.ts')).toMatch(/new PostgresAuthStore\(statementGuardedSqlClient\(roleScopedSqlClient\(poolSqlClient\(pool\)\)\)\)/);
     // No organization identifier is ever read from a request.
     expect(src('./http.ts')).not.toMatch(/organization/i);
-    // The service's only organization reference compares the membership row with the store's server-side context.
-    expect(src('./service.ts').match(/organizationId/g)).toEqual(['organizationId']);
+    // Both service organization references compare the membership row with the store's server-side context.
+    expect(src('./service.ts').match(/organizationId/g)).toEqual(['organizationId', 'organizationId']);
     expect(src('./service.ts')).toMatch(/belongsToOrganization\(this\.deps\.store\.context, member\.organizationId\)/);
   });
 });

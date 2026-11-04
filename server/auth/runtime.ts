@@ -1,4 +1,6 @@
-import { getDatabase } from '@netlify/database';
+import { productionDatabaseReady, targetDigest } from './production-database';
+import type { RuntimeIdentity } from './production-policy';
+import { getDatabase, getConnectionString } from '@netlify/database';
 import { readServerEnv, type EnvReader } from './config';
 import type { DepsFactory } from './http';
 import { SupabaseIdentityProvider } from './provider-supabase';
@@ -9,7 +11,7 @@ import type { SqlClient } from './types';
 
 interface PgLikeResult { rows: unknown[]; command?: string }
 interface PgLikeClient { query(text: string, params?: unknown[]): Promise<PgLikeResult>; release(destroy?: boolean | Error): void }
-interface PgLikePool { query(text: string, params?: unknown[]): Promise<PgLikeResult>; connect(): Promise<PgLikeClient>; on?(event: 'error', listener: (error: unknown) => void): unknown }
+interface PgLikePool { query(text: string, params?: unknown[]): Promise<PgLikeResult>; connect(): Promise<PgLikeClient>; on?(event: 'error', listener: (error: unknown) => void): unknown; end?(): Promise<void> }
 
 export class TransactionClosedError extends Error {
   constructor() { super('transaction_closed'); this.name = 'TransactionClosedError'; }
@@ -75,27 +77,50 @@ export function poolSqlClient(pool: PgLikePool): SqlClient {
   };
 }
 
-let sharedStore: PostgresAuthStore | null = null;
-function platformPool(): PgLikePool {
+let sharedPool: { target: string; binding: string; pool: PgLikePool } | null = null;
+/**
+ * Returns the platform pool for the verified target. The target digest (endpoint, port, database) must equal the
+ * evidence-bound target. A warm instance whose binding moves to a different target fails closed and never reuses or
+ * rebuilds a pool for it. A changed binding for the same target (credential rotation or connection parameters) safely
+ * replaces the pool: the old pool is drained in the background and the readiness cache misses on the new pool object.
+ */
+export function platformPool(expectedTarget: string): PgLikePool {
+  const binding = getConnectionString();
+  const target = targetDigest(binding);
+  if (!target || target !== expectedTarget) throw new Error('database_binding_mismatch');
+  if (sharedPool) {
+    if (sharedPool.target !== target) throw new Error('database_target_changed');
+    if (sharedPool.binding === binding) return sharedPool.pool;
+    const retired = sharedPool.pool;
+    sharedPool = null;
+    void Promise.resolve().then(() => retired.end?.()).catch(error => logDatabaseError('pool_retire', error));
+  }
   const pool = getDatabase().pool as unknown as PgLikePool;
   // An idle pooled connection that errors (e.g. dropped by the server) emits 'error' on the pool; without a
   // listener Node treats it as unhandled and crashes the function instance. The pool discards that client itself.
   pool.on?.('error', error => logDatabaseError('pool_idle_client', error));
+  sharedPool = { target, binding, pool };
   return pool;
 }
+/** Offline tests only. */
+export function resetPlatformPoolForTests(): void { sharedPool = null; }
 // Every auth statement runs as the restricted hourvia_auth_runtime role, never with the owner's privileges, and only
 // after passing the store statement policy (single SELECT/INSERT/UPDATE, no role or setting changes).
-const store = () => (sharedStore ??= new PostgresAuthStore(statementGuardedSqlClient(roleScopedSqlClient(poolSqlClient(platformPool())))));
+const store = (pool: PgLikePool) => new PostgresAuthStore(statementGuardedSqlClient(roleScopedSqlClient(poolSqlClient(pool))));
 
 /** Production wiring for Netlify Functions. All secrets come from protected environment variables. */
-export function runtimeDeps(env: EnvReader, deployContext: string | undefined): DepsFactory {
+export function runtimeDeps(env: EnvReader, deployContext: string | undefined, identity?: RuntimeIdentity): DepsFactory {
   return async () => {
-    const serverEnv = readServerEnv(env, deployContext);
+    const serverEnv = readServerEnv(env, deployContext, identity);
     if ('unavailable' in serverEnv) return serverEnv;
+    let verifiedPool: PgLikePool | undefined;
+    const expectedTarget = targetDigest(env('NETLIFY_DB_URL'));
+    if (!expectedTarget || !await productionDatabaseReady(() => (verifiedPool = platformPool(expectedTarget)), env, identity)
+      || !verifiedPool) return { unavailable: 'database_not_verified' };
     const { supabase, config } = serverEnv;
     return {
       config,
-      store: store(),
+      store: store(verifiedPool),
       provider: new SupabaseIdentityProvider(supabase.url, supabase.anonKey, supabase.serviceRoleKey),
       now: () => new Date(),
       sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),

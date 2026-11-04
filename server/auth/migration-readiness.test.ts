@@ -199,10 +199,10 @@ describe('restricted runtime role is the only path for auth SQL, and it fails cl
     const store = new PostgresAuthStore(roleScopedSqlClient(pgliteClient(pg)));
     await expect(store.findMemberByEmail('a@t.test')).rejects.toThrow(/permission denied/);
   });
-  it('production wiring wraps the platform pool with roleScopedSqlClient and nothing else touches the database', () => {
+  it('production store wraps the verified pool with roleScopedSqlClient and retains one platform database entry point', () => {
     const read = (p: string) => readFileSync(fileURLToPath(new URL(p, import.meta.url)), 'utf8');
     const runtime = read('./runtime.ts');
-    expect(runtime).toMatch(/new PostgresAuthStore\(statementGuardedSqlClient\(roleScopedSqlClient\(poolSqlClient\(platformPool\(\)\)\)\)\)/);
+    expect(runtime).toMatch(/new PostgresAuthStore\(statementGuardedSqlClient\(roleScopedSqlClient\(poolSqlClient\(pool\)\)\)\)/);
     expect(runtime).toMatch(/const pool = getDatabase\(\)\.pool/);
     expect(runtime.match(/new PostgresAuthStore\(/g)).toHaveLength(1);
     expect(runtime.match(/getDatabase\(/g)).toHaveLength(1);

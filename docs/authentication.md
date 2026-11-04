@@ -1,3 +1,5 @@
+> Superseded operational guidance: use [Sprint 2.0B.2 production pre-launch controls](production-prelaunch.md). Earlier activation, general-stage, dev/provider, invitation and preview-promotion steps below are historical and must not be executed as current instructions.
+
 # Hourvia authentication (Sprint 1.7)
 
 Supabase Auth verifies credentials. Hourvia's Netlify Functions own sessions, workspace membership, roles, assignments, rate limits, and audit. Resend delivers Supabase's transactional email through custom SMTP. Browser code never handles a provider token, refresh token, or service credential.

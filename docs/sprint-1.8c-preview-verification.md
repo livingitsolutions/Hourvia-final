@@ -1,3 +1,5 @@
+> Superseded operational guidance: use [Sprint 2.0B.2 production pre-launch controls](production-prelaunch.md). Earlier activation, general-stage, dev/provider, invitation and preview-promotion steps below are historical and must not be executed as current instructions.
+
 # Sprint 1.8C — Controlled preview verification of `20261104160000`
 
 This runbook verifies Sprint 1.8B (H-1 `pg_temp` hardening and M-1 platform rate limits) on a real Netlify Database

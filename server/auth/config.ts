@@ -1,4 +1,6 @@
 import type { AuthConfig } from './types';
+import { deploymentAllowed, PRODUCTION_ORIGIN, type RuntimeIdentity } from './production-policy';
+import { parseIdentityPolicy } from './synthetic-policy';
 
 export type EnvReader = (name: string) => string | undefined;
 
@@ -27,16 +29,13 @@ function parseSmokeTestEmails(raw: string | undefined): ReadonlySet<string> | nu
  * the legacy names (SUPABASE_ANON_KEY / SUPABASE_SERVICE_ROLE_KEY). VITE_-prefixed variables are never read:
  * anything VITE_ can be inlined into the browser bundle.
  *
- * Production additionally requires HOURVIA_AUTH_ALLOW_PRODUCTION=true, an explicit HOURVIA_APP_ORIGIN and an
- * explicit launch stage: "smoke" (designated test accounts only) or "general".
+ * Production requires trusted artifact identity, explicit authorization, the canonical origin, smoke stage,
+ * and a complete exact synthetic/protected identity policy. No dev or preview provider access is allowed.
  */
-export function readServerEnv(env: EnvReader, deployContext: string | undefined): ServerEnv | { unavailable: string } {
-  const production = deployContext === 'production';
-  // Hourvia_Authentication is the production identity provider and there is no nonproduction project, so deploy
-  // previews, branch deploys and unknown contexts never get a working auth function, even if secrets leak into
-  // their scope. Only production (behind its gates) and local `netlify dev` can run.
-  if (!production && deployContext !== 'dev') return { unavailable: 'context_not_enabled' };
-  if (production && env('HOURVIA_AUTH_ALLOW_PRODUCTION') !== 'true') return { unavailable: 'production_not_enabled' };
+export function readServerEnv(env: EnvReader, deployContext: string | undefined, identity?: RuntimeIdentity): ServerEnv | { unavailable: string } {
+  if (deployContext !== 'production') return { unavailable: 'context_not_enabled' };
+  if (!deploymentAllowed(identity)) return { unavailable: 'deployment_not_verified' };
+  if (env('HOURVIA_AUTH_ALLOW_PRODUCTION') !== 'true') return { unavailable: 'production_not_enabled' };
   const url = env('SUPABASE_URL');
   const anonKey = env('SUPABASE_PUBLISHABLE_KEY') || env('SUPABASE_ANON_KEY');
   const serviceRoleKey = env('SUPABASE_SECRET_KEY') || env('SUPABASE_SERVICE_ROLE_KEY');
@@ -46,21 +45,18 @@ export function readServerEnv(env: EnvReader, deployContext: string | undefined)
     || anonKey.startsWith('sb_secret_') || serviceRoleKey.startsWith('sb_publishable_')) return { unavailable: 'misconfigured' };
   const origin = env('HOURVIA_APP_ORIGIN');
   const appOrigin = origin && /^https:\/\/[a-z0-9.-]+(:\d+)?$/i.test(origin) ? origin : null;
-  if (production && !appOrigin) return { unavailable: 'misconfigured' };
+  if (appOrigin !== PRODUCTION_ORIGIN) return { unavailable: 'misconfigured' };
 
-  const stage = env('HOURVIA_AUTH_LAUNCH_STAGE');
-  let smokeTestEmails: ReadonlySet<string> | null = null;
-  if (stage === 'smoke') {
-    smokeTestEmails = parseSmokeTestEmails(env('HOURVIA_AUTH_SMOKE_TEST_EMAILS'));
-    if (!smokeTestEmails) return { unavailable: 'misconfigured' };
-  } else if (stage !== 'general' && (production || stage !== undefined)) {
-    return { unavailable: 'launch_stage_not_set' };
-  }
+  if (env('HOURVIA_AUTH_LAUNCH_STAGE') !== 'smoke') return { unavailable: 'smoke_required' };
+  const smokeTestEmails = parseSmokeTestEmails(env('HOURVIA_AUTH_SMOKE_TEST_EMAILS'));
+  const prelaunch = parseIdentityPolicy(env('HOURVIA_SYNTHETIC_IDENTITY_POLICY'), smokeTestEmails);
+  if (!prelaunch) return { unavailable: 'synthetic_policy_invalid' };
 
   const idle = bounded(env('HOURVIA_SESSION_IDLE_SECONDS'), 1800, 300, 7200);
   return {
     supabase: { url, anonKey, serviceRoleKey },
     config: {
+      prelaunch,
       hashKey,
       appOrigin,
       emailDeliveryAuthorized: env('HOURVIA_EMAIL_DELIVERY_AUTHORIZED') === 'true' && appOrigin !== null,
