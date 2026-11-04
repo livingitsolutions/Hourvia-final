@@ -8,7 +8,7 @@
 import { PGlite } from '@electric-sql/pglite';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { handleAuthRequest } from './http';
-import { poolSqlClient } from './runtime';
+import { poolSqlClient, TransactionClosedError } from './runtime';
 import { AUTH_DB_ROLE, assertAllowedStatement, roleScopedSqlClient, SqlStatementRejectedError, statementGuardedSqlClient } from './sql-role';
 import { PostgresAuthStore } from './store-postgres';
 import { ORIGIN, ROLE_SQL, SCHEMA_SQL, applyMigration, asNetlifyOwner, createHarness, type Harness } from './testing/harness';
@@ -39,9 +39,39 @@ describe('G-1: store statement policy', () => {
     'ALTER TABLE auth_audit_events DISABLE TRIGGER ALL',
     'WITH x AS (SELECT 1) SELECT * FROM x',
     'EXPLAIN SELECT 1',
+    // Sprint 1.9C.1 (gate finding F-1): bypasses that passed the 1.9C policy.
+    `SELECT "set_config"('role', 'netlifydb_owner', true)`,
+    `SELECT pg_catalog."set_config"('role', 'netlifydb_owner', true)`,
+    `SELECT U&"set\\005fconfig"('role', 'netlifydb_owner', true)`,
+    `SELECT u&'\\0041'`,
+    `SELECT SET_CONFIG('role', 'netlifydb_owner', true)`,
+    `SELECT set_config`,
+    `SELECT (pg_catalog.set_config)('role', 'x', true)`,
+    `UPDATE pg_settings SET setting = 'netlifydb_owner' WHERE name = 'role'`,
+    `UPDATE pg_catalog.pg_settings SET setting = 'pg_temp, public' WHERE name = 'search_path'`,
+    `SELECT setting FROM PG_SETTINGS WHERE name = $1`,
+    `SELECT * FROM "workspace_members"`,
   ];
   it.each(rejected)('rejects %s', text => {
     expect(() => assertAllowedStatement(text)).toThrow(SqlStatementRejectedError);
+  });
+  it.each(rejected)('rejects %s before the database is contacted, in query() and inside transaction()', async text => {
+    const reached: string[] = [];
+    const inner: SqlClient = {
+      query: async <T>(t: string) => { reached.push(t); return { rows: [] as T[] }; },
+      transaction: async fn => fn(inner),
+    };
+    const guarded = statementGuardedSqlClient(inner);
+    await expect(guarded.query(text)).rejects.toThrow(SqlStatementRejectedError);
+    await expect(guarded.transaction(async tx => tx.query(text))).rejects.toThrow(SqlStatementRejectedError);
+    expect(reached).toEqual([]);
+  });
+  it('names the rule that fired for each F-1 bypass shape', () => {
+    const reason = (t: string) => { try { assertAllowedStatement(t); return 'allowed'; } catch (e) { return (e as Error).message.replace('sql_statement_rejected:', ''); } };
+    expect(reason(`SELECT "set_config"('role', 'x', true)`)).toBe('quoted_identifier');
+    expect(reason(`SELECT U&'\\0041'`)).toBe('unicode_escape');
+    expect(reason(`SELECT pg_catalog.set_config('role', 'x', true)`)).toBe('set_config');
+    expect(reason(`UPDATE pg_settings SET setting = 'x' WHERE name = 'role'`)).toBe('pg_settings');
   });
   it('accepts the statement shapes the store uses, including UPDATE … SET role = …', () => {
     for (const text of ['  SELECT 1', '\n  INSERT INTO t (a) VALUES ($1)', `UPDATE workspace_members SET role = $3 WHERE id = $2`]) expect(() => assertAllowedStatement(text)).not.toThrow();
@@ -95,6 +125,14 @@ describe('G-1: store statement policy', () => {
       await expect(guarded.transaction(async tx => { await tx.query('RESET ROLE'); })).rejects.toThrow(/statement_kind/);
       await expect(guarded.transaction(async tx => { await tx.query('SELECT 1; RESET ROLE'); })).rejects.toThrow(/multiple_statements/);
       expect((await guarded.query<{ u: string }>('SELECT current_user AS u')).rows[0]!.u).toBe(AUTH_DB_ROLE);
+    });
+    it('F-1: the quoted set_config bypass really escapes on the raw client, and the guarded client refuses it', async () => {
+      const bypass = `SELECT "set_config"('role', 'netlifydb_owner', true)`;
+      const escaped = await h.sql.transaction(async tx => { await tx.query(bypass); return (await tx.query<{ u: string }>('SELECT current_user AS u')).rows[0]!.u; });
+      expect(escaped).toBe('netlifydb_owner'); // proves the probe exercises the real vector
+      const guarded = statementGuardedSqlClient(h.sql);
+      await expect(guarded.transaction(async tx => { await tx.query(bypass); })).rejects.toThrow(/quoted_identifier/);
+      await expect(guarded.query(`UPDATE pg_settings SET setting = 'netlifydb_owner' WHERE name = 'role'`)).rejects.toThrow(/pg_settings/);
     });
     it('a guard rejection fails the request closed with 503 and no data', async () => {
       const bad = new PostgresAuthStore(statementGuardedSqlClient({ query: () => Promise.reject(new SqlStatementRejectedError('statement_kind')), transaction: () => Promise.reject(new SqlStatementRejectedError('statement_kind')) }));
@@ -169,6 +207,165 @@ describe('G-2: pooled connections never keep the runtime role or run stale trans
     await sql.query('SELECT 1');
     expect(log).toEqual(['BEGIN', `SET LOCAL ROLE ${AUTH_DB_ROLE}`, 'SELECT 1', 'COMMIT', 'release']);
     expect(log).not.toContain('pool.query'); // the role-scoped path never uses the owner-level pool.query
+  });
+});
+
+/**
+ * A pg-like pool whose single client executes statements strictly in FIFO order with a small delay per statement,
+ * like node-postgres' per-client query queue. That reproduces the COMMIT/ROLLBACK window exactly: a statement handed
+ * to the client while COMMIT is pending would run after it.
+ */
+function fifoPool(opts: { fail?: (text: string) => Error | null; commitTag?: string } = {}) {
+  const log: string[] = [];
+  const releases: unknown[] = [];
+  let chain: Promise<unknown> = Promise.resolve();
+  const query = (text: string) => {
+    const run = chain.then(async () => {
+      await new Promise(r => setTimeout(r, 3));
+      log.push(text);
+      const error = opts.fail?.(text);
+      if (error) throw error;
+      return { rows: [] as unknown[], command: text === 'COMMIT' ? (opts.commitTag ?? 'COMMIT') : text.split(' ')[0] };
+    });
+    chain = run.then(() => undefined, () => undefined);
+    return run;
+  };
+  const client = { query, release: (destroy?: unknown) => { log.push('release'); releases.push(destroy); } };
+  return { log, releases, pool: { query: async () => { log.push('pool.query'); return { rows: [] }; }, connect: async () => client } };
+}
+const pause = (ms: number) => new Promise(r => setTimeout(r, ms));
+const HEAD = ['BEGIN', `SET LOCAL ROLE ${AUTH_DB_ROLE}`];
+
+describe('G-2b (Sprint 1.9C.1, gate finding F-2): handles close when the callback settles, before COMMIT/ROLLBACK', () => {
+  it('rejects a delayed query issued while COMMIT is in flight; it never reaches the connection', async () => {
+    const f = fifoPool();
+    const sql = roleScopedSqlClient(poolSqlClient(f.pool));
+    let late: Promise<unknown> = Promise.resolve();
+    await sql.transaction(async tx => {
+      await tx.query('SELECT 1');
+      late = pause(1).then(() => tx.query('SELECT late'));
+    });
+    await expect(late).rejects.toBeInstanceOf(TransactionClosedError);
+    await pause(20);
+    expect(f.log).toEqual([...HEAD, 'SELECT 1', 'COMMIT', 'release']);
+  });
+
+  it('rejects a delayed query issued while ROLLBACK is in flight', async () => {
+    const f = fifoPool();
+    const sql = roleScopedSqlClient(poolSqlClient(f.pool));
+    let late: Promise<unknown> = Promise.resolve();
+    await expect(sql.transaction(async tx => {
+      await tx.query('SELECT 1');
+      late = pause(1).then(() => tx.query('SELECT late'));
+      throw new Error('app');
+    })).rejects.toThrow('app');
+    await expect(late).rejects.toBeInstanceOf(TransactionClosedError);
+    await pause(20);
+    expect(f.log).toEqual([...HEAD, 'SELECT 1', 'ROLLBACK', 'release']);
+  });
+
+  it('rejects a retained handle after completion', async () => {
+    const f = fifoPool();
+    let stale: SqlClient | null = null;
+    await poolSqlClient(f.pool).transaction(async tx => { stale = tx; });
+    await expect(stale!.query('SELECT 1')).rejects.toBeInstanceOf(TransactionClosedError);
+    expect(f.log).toEqual(['BEGIN', 'COMMIT', 'release']);
+  });
+
+  it('concurrent Promise branches: a sibling still running after another branch threw cannot issue more SQL', async () => {
+    const f = fifoPool();
+    const sql = roleScopedSqlClient(poolSqlClient(f.pool));
+    let sibling: Promise<unknown> = Promise.resolve();
+    await expect(sql.transaction(async tx => {
+      const failing = (async () => { await tx.query('SELECT a'); throw new Error('branch a failed'); })();
+      sibling = (async () => { await pause(15); return tx.query('UPDATE b'); })();
+      await Promise.all([failing, sibling]);
+    })).rejects.toThrow('branch a failed');
+    await expect(sibling).rejects.toBeInstanceOf(TransactionClosedError);
+    await pause(30);
+    expect(f.log).toEqual([...HEAD, 'SELECT a', 'ROLLBACK', 'release']);
+  });
+
+  it('concurrent Promise branches that all finish inside the callback run inside the transaction', async () => {
+    const f = fifoPool();
+    const sql = roleScopedSqlClient(poolSqlClient(f.pool));
+    await sql.transaction(async tx => { await Promise.all([tx.query('SELECT a'), tx.query('SELECT b')]); });
+    expect(f.log).toEqual([...HEAD, 'SELECT a', 'SELECT b', 'COMMIT', 'release']);
+  });
+
+  it('drains un-awaited queries before COMMIT, and rolls back (and throws) if one of them failed', async () => {
+    const ok = fifoPool();
+    await roleScopedSqlClient(poolSqlClient(ok.pool)).transaction(async tx => { void tx.query('UPDATE x'); });
+    expect(ok.log).toEqual([...HEAD, 'UPDATE x', 'COMMIT', 'release']);
+
+    const bad = fifoPool({ fail: t => (t === 'UPDATE x' ? new Error('write failed') : null) });
+    await expect(roleScopedSqlClient(poolSqlClient(bad.pool)).transaction(async tx => { void tx.query('UPDATE x').catch(() => undefined); return 'reported success'; }))
+      .rejects.toThrow('write failed');
+    expect(bad.log).toEqual([...HEAD, 'UPDATE x', 'ROLLBACK', 'release']);
+    expect(bad.log).not.toContain('COMMIT');
+  });
+
+  it('treats a COMMIT that the server reports as ROLLBACK as a failure', async () => {
+    const f = fifoPool({ commitTag: 'ROLLBACK' });
+    await expect(poolSqlClient(f.pool).transaction(async () => 'value')).rejects.toThrow('transaction_rolled_back');
+  });
+
+  it('still destroys the connection when ROLLBACK fails, and reports the original error', async () => {
+    const f = fifoPool({ fail: t => (t === 'ROLLBACK' ? new Error('connection lost') : null) });
+    await expect(poolSqlClient(f.pool).transaction(async () => { throw new Error('app'); })).rejects.toThrow('app');
+    expect(f.releases).toHaveLength(1);
+    expect(f.releases[0]).toBeInstanceOf(Error);
+  });
+
+  it('pooled reuse (real Postgres semantics, one physical connection): after a branch failure the connection is clean', async () => {
+    const pg = new PGlite(); await asNetlifyOwner(pg); await applyMigration(pg, SCHEMA_SQL); await applyMigration(pg, ROLE_SQL);
+    const sql = roleScopedSqlClient(poolSqlClient(singleConnectionPool(pg)));
+    let sibling: Promise<unknown> = Promise.resolve();
+    await expect(sql.transaction(async tx => {
+      const denied = tx.query('SELECT * FROM auth_audit_events'); // permission denied as the runtime role
+      sibling = (async () => { await pause(10); return tx.query('SELECT * FROM auth_audit_events'); })();
+      await Promise.all([denied, sibling]);
+    })).rejects.toThrow(/permission denied/);
+    await expect(sibling).rejects.toBeInstanceOf(TransactionClosedError);
+    expect((await pg.query<{ c: string }>('SELECT current_user AS c')).rows[0]!.c).toBe('netlifydb_owner');
+    expect((await sql.query<{ c: string }>('SELECT current_user AS c')).rows[0]!.c).toBe(AUTH_DB_ROLE);
+  });
+});
+
+describe('G-3b (Sprint 1.9C.1, gate finding F-3): one lock order for every membership write', () => {
+  it('acceptInvitation, disableMember and upsertInvitation lock workspace_members before workspace_invitations', async () => {
+    const issued: string[] = [];
+    const recorder: SqlClient = {
+      query: async <T>(text: string) => { issued.push(text.trim().replace(/\s+/g, ' ')); return { rows: [{ id: 'x' } as T] }; },
+      transaction: async fn => fn(recorder),
+    };
+    const store = new PostgresAuthStore(statementGuardedSqlClient(recorder));
+    const now = new Date();
+    const firstTable = async (run: () => Promise<unknown>) => {
+      issued.length = 0; await run();
+      const members = issued.findIndex(t => /workspace_members/.test(t));
+      const invitations = issued.findIndex(t => /workspace_invitations/.test(t));
+      return { members, invitations, first: issued[0]! };
+    };
+    const accept = await firstTable(() => store.acceptInvitation('m', now));
+    expect(accept.first).toMatch(/^SELECT id FROM workspace_members .* FOR NO KEY UPDATE$/);
+    expect(accept.members).toBeLessThan(accept.invitations);
+    const disable = await firstTable(() => store.disableMember('m', 'a', now));
+    expect(disable.members).toBe(0); expect(disable.members).toBeLessThan(disable.invitations);
+    const upsert = await firstTable(() => store.upsertInvitation({ email: 'e@t.test', role: 'contractor', displayName: '', authUserId: 'u', invitedBy: 'a', now, expiresAt: now }));
+    expect(upsert.members).toBe(0); expect(upsert.members).toBeLessThan(upsert.invitations);
+  });
+  it('acceptInvitation semantics are unchanged: unknown member → false with no invitation write; normal accept still activates', async () => {
+    const h = await createHarness();
+    expect(await h.deps.store.acceptInvitation('00000000-0000-4000-8000-000000000000', new Date())).toBe(false);
+    const admin = await h.login((await h.seedMember('a@t.test', 'workspace_admin')).email);
+    const inv = await h.call('POST', '/api/admin/invitations', { cookie: admin.cookie, body: { email: 'n@t.test', role: 'contractor' } });
+    const id = inv.json!.member.id as string;
+    expect(await h.deps.store.acceptInvitation(id, h.deps.now())).toBe(true);
+    const { rows } = await h.pg.query<{ m: string; i: string }>(`SELECT m.status AS m, i.status AS i FROM workspace_members m JOIN workspace_invitations i ON i.member_id = m.id WHERE m.id = $1`, [id]);
+    expect(rows).toEqual([{ m: 'active', i: 'accepted' }]);
+    const audit = await h.pg.query<{ d: { to_status: string; source: string } }>(`SELECT details AS d FROM auth_audit_events WHERE subject_member_id = $1 AND event_type = 'membership_status_changed'`, [id]);
+    expect(audit.rows.map(r => [r.d.to_status, r.d.source])).toEqual([['active', 'application']]);
   });
 });
 

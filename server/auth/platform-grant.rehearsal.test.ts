@@ -12,11 +12,11 @@ import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { handleAuthRequest } from './http';
-import { poolSqlClient } from './runtime';
+import { poolSqlClient, TransactionClosedError } from './runtime';
 import { roleScopedSqlClient, statementGuardedSqlClient } from './sql-role';
 import { PostgresAuthStore } from './store-postgres';
-import { FakeSupabase, GRANT_PLATFORM_SQL, ORIGIN, PLATFORM_EMAIL, PLATFORM_ROLES_SQL, PLATFORM_SQL, ROLE_SQL, SCHEMA_SQL, SUPER_ADMIN_SQL, fillOperatorSql } from './testing/harness';
-import type { AuthConfig, AuthDeps } from './types';
+import { FakeSupabase, GRANT_PLATFORM_SQL, ORIGIN, PLATFORM_ADMIN_SQL, PLATFORM_EMAIL, PLATFORM_ROLES_SQL, PLATFORM_SQL, ROLE_SQL, SCHEMA_SQL, SEARCH_PATH_SQL, SUPER_ADMIN_SQL, fillOperatorSql } from './testing/harness';
+import type { AuthConfig, AuthDeps, SqlClient } from './types';
 
 interface PgClient { connect(): Promise<void>; end(): Promise<void>; query<T = any>(text: string, params?: unknown[]): Promise<{ rows: T[]; rowCount: number | null }> }
 interface PgModule {
@@ -125,14 +125,16 @@ describe.skipIf(!enabled)('AP-PSA-GRANT rehearsal on a disposable PostgreSQL 18 
       throw new Error('refusing: cluster is not freshly initialised');
     }
 
-    // ---- Template: platform role emulation + the four migrations, unchanged, as non-superuser netlifydb_owner. ----
+    // ---- Template: platform role emulation + the applied migrations, unchanged, as non-superuser netlifydb_owner. ----
     await admin.query(`CREATE DATABASE ${TEMPLATE}`);
     created.add(TEMPLATE);
     const t = superuser(TEMPLATE);
     await t.connect();
     await t.query(PLATFORM_ROLES_SQL);
     await t.query('SET SESSION AUTHORIZATION netlifydb_owner');
-    for (const [name, sql] of [['20261103170000', SCHEMA_SQL], ['20261103170100', ROLE_SQL], ['20261104120000', SUPER_ADMIN_SQL], ['20261104130000', PLATFORM_SQL]] as const) {
+    // Sprint 1.9C.1: all six applied migrations, exactly as on the preview and production branches.
+    for (const [name, sql] of [['20261103170000', SCHEMA_SQL], ['20261103170100', ROLE_SQL], ['20261104120000', SUPER_ADMIN_SQL], ['20261104130000', PLATFORM_SQL],
+      ['20261104150000', PLATFORM_ADMIN_SQL], ['20261104160000', SEARCH_PATH_SQL]] as const) {
       await t.query('BEGIN'); await t.query(sql); await t.query('COMMIT'); // one transaction per file, like the runner
       log(`applied migration ${name} sha256:${sha(sql)}`);
     }
@@ -347,6 +349,156 @@ describe.skipIf(!enabled)('AP-PSA-GRANT rehearsal on a disposable PostgreSQL 18 
         expect(await s.a.query(grantSql(uid, lis.id)).then(() => null, (e: Error) => e.message)).toMatch(/grant_guard: the membership is disabled/);
         expect(await s.state()).toEqual(st);
       } finally { await pool.end(); }
+    });
+  });
+
+  // ---- Sprint 1.9C.1: application runtime under real concurrency (F-2 transaction lifecycle, F-3 lock order) --------
+  /** The production client chain over a real pg.Pool, optionally pausing (transaction still open) before one statement. */
+  const appStore = (s: Scenario, app: string, pauseBefore?: RegExp) => {
+    const pool = new pg.Pool({ host: SOCKET, port: PORT, user: 'netlifydb_owner', database: s.db, max: 1, application_name: app });
+    const base = statementGuardedSqlClient(roleScopedSqlClient(poolSqlClient(pool as any)));
+    let open!: () => void; const gate = new Promise<void>(r => { open = r; });
+    let arrived!: () => void; const atGate = new Promise<void>(r => { arrived = r; });
+    const pausing = (c: SqlClient): SqlClient => ({
+      query: async <T>(text: string, params?: unknown[]) => { if (pauseBefore?.test(text.trim())) { arrived(); await gate; } return c.query<T>(text, params); },
+      transaction: fn => c.transaction(tx => fn(pausing(tx))),
+    });
+    return { pool, sql: base, store: new PostgresAuthStore(pausing(base)), atGate, release: () => open() };
+  };
+  const waitAppBlocked = async (s: Scenario, app: string) => {
+    for (let i = 0; i < 200; i++) {
+      const r = (await s.mon.query<{ pid: number; w: string | null; blockers: number[] }>(
+        `SELECT pid, wait_event_type w, pg_blocking_pids(pid) blockers FROM pg_stat_activity WHERE datname = current_database() AND application_name = $1`, [app])).rows[0];
+      if (r?.w === 'Lock' && r.blockers.length) return r;
+      await sleep(25);
+    }
+    throw new Error(`${app} never blocked on a lock`);
+  };
+  /** Superuser probe: can the invitation rows be locked right now without waiting? (Always rolled back.) */
+  const invitationLockFree = async (s: Scenario, memberId: string) => {
+    await s.mon.query('BEGIN');
+    try { await s.mon.query(`SELECT 1 FROM workspace_invitations WHERE member_id = $1 FOR UPDATE NOWAIT`, [memberId]); return true; }
+    catch (e) { if (/could not obtain lock/.test((e as Error).message)) return false; throw e; }
+    finally { await s.mon.query('ROLLBACK'); }
+  };
+  const seedInvited = async (s: Scenario) => {
+    const adm = await s.seed('workspace_admin', 'active', 'admin@rehearsal.invalid');
+    const inv = await s.seed('contractor', 'invited', 'invitee@rehearsal.invalid');
+    await s.a.query(`INSERT INTO workspace_invitations (workspace_id, member_id, email, role, status, invited_by_member_id, created_at, expires_at)
+      VALUES ('thrivesource', $1, 'invitee@rehearsal.invalid', 'contractor', 'pending', $2, now(), now() + interval '7 days')`, [inv.id, adm.id]);
+    return { adm, inv };
+  };
+  const membershipOutcome = async (s: Scenario, memberId: string) => ({
+    member: (await s.mon.query(`SELECT status FROM workspace_members WHERE id = $1`, [memberId])).rows[0].status,
+    invitations: (await s.mon.query(`SELECT status FROM workspace_invitations WHERE member_id = $1 ORDER BY created_at`, [memberId])).rows.map((r: any) => r.status),
+    audit: (await s.mon.query(`SELECT details->>'to_status' AS s, details->>'source' AS src FROM auth_audit_events
+      WHERE subject_member_id = $1 AND event_type = 'membership_status_changed' ORDER BY id`, [memberId])).rows.map((r: any) => `${r.s}:${r.src}`),
+  });
+  const settle = (p: Promise<unknown>) => p.then(v => ({ ok: true as const, v }), (e: any) => ({ ok: false as const, code: e?.code, message: String(e?.message) }));
+
+  it('6a. F-3: disable holds the member row; a concurrent accept waits on the MEMBER row (invitation untouched), no deadlock', async () => {
+    await withScenario('s6a', async s => {
+      const { adm, inv } = await seedInvited(s);
+      const disabler = appStore(s, 'hv-disable', /^UPDATE workspace_invitations SET status = 'revoked'/);
+      const accepter = appStore(s, 'hv-accept');
+      try {
+        const disable = settle(disabler.store.disableMember(inv.id, adm.id, new Date()));
+        await disabler.atGate; // member row updated and locked; invitation revocation not yet sent
+        const accept = settle(accepter.store.acceptInvitation(inv.id, new Date()));
+        const blocked = await waitAppBlocked(s, 'hv-accept');
+        const free = await invitationLockFree(s, inv.id); // with the old order accept would already hold the invitation row
+        log('6a:', JSON.stringify({ blocked, invitationLockFree: free }));
+        expect(free).toBe(true);
+        disabler.release();
+        const [d, a] = await Promise.all([disable, accept]);
+        log('6a: results', JSON.stringify({ disable: d, accept: a }));
+        expect(d).toEqual({ ok: true, v: true });
+        expect(a).toEqual({ ok: true, v: false }); // invitation was revoked first: acceptance correctly refused
+        expect(await membershipOutcome(s, inv.id)).toEqual({ member: 'disabled', invitations: ['revoked'], audit: ['disabled:application'] });
+      } finally { disabler.release(); accepter.release(); await disabler.pool.end(); await accepter.pool.end(); }
+    });
+  });
+
+  it('6b. F-3: accept holds the member row; a concurrent disable waits, then disables the activated member, no deadlock', async () => {
+    await withScenario('s6b', async s => {
+      const { adm, inv } = await seedInvited(s);
+      const accepter = appStore(s, 'hv-accept', /^UPDATE workspace_members SET status = 'active'/);
+      const disabler = appStore(s, 'hv-disable');
+      try {
+        const accept = settle(accepter.store.acceptInvitation(inv.id, new Date()));
+        await accepter.atGate; // member row locked FOR NO KEY UPDATE and invitation accepted, transaction open
+        const disable = settle(disabler.store.disableMember(inv.id, adm.id, new Date()));
+        const blocked = await waitAppBlocked(s, 'hv-disable');
+        log('6b:', JSON.stringify({ blocked }));
+        accepter.release();
+        const [a, d] = await Promise.all([accept, disable]);
+        log('6b: results', JSON.stringify({ accept: a, disable: d }));
+        expect(a).toEqual({ ok: true, v: true });
+        expect(d).toEqual({ ok: true, v: true });
+        expect(await membershipOutcome(s, inv.id)).toEqual({ member: 'disabled', invitations: ['accepted'], audit: ['active:application', 'disabled:application'] });
+      } finally { disabler.release(); accepter.release(); await disabler.pool.end(); await accepter.pool.end(); }
+    });
+  });
+
+  it('6c. F-3: 20 racing accept/disable pairs on fresh members never deadlock and always end disabled', async () => {
+    await withScenario('s6c', async s => {
+      const adm = await s.seed('workspace_admin', 'active', 'admin@rehearsal.invalid');
+      const accepter = appStore(s, 'hv-accept'); const disabler = appStore(s, 'hv-disable');
+      try {
+        const outcomes: string[] = [];
+        for (let i = 0; i < 20; i++) {
+          const inv = await s.seed('contractor', 'invited', `race${i}@rehearsal.invalid`);
+          await s.a.query(`INSERT INTO workspace_invitations (workspace_id, member_id, email, role, status, invited_by_member_id, created_at, expires_at)
+            VALUES ('thrivesource', $1, $2, 'contractor', 'pending', $3, now(), now() + interval '7 days')`, [inv.id, `race${i}@rehearsal.invalid`, adm.id]);
+          const [a, d] = await Promise.all([settle(accepter.store.acceptInvitation(inv.id, new Date())), settle(disabler.store.disableMember(inv.id, adm.id, new Date()))]);
+          expect(a.ok && d.ok).toBe(true); // no 40P01 deadlock, no other error
+          const o = await membershipOutcome(s, inv.id);
+          expect(o.member).toBe('disabled');
+          expect(o.invitations.length).toBe(1);
+          outcomes.push(o.invitations[0]!);
+        }
+        log('6c: invitation outcomes', JSON.stringify(outcomes.reduce<Record<string, number>>((m, x) => ({ ...m, [x]: (m[x] ?? 0) + 1 }), {})));
+      } finally { disabler.release(); accepter.release(); await disabler.pool.end(); await accepter.pool.end(); }
+    });
+  });
+
+  it('7a. F-2: on a real pooled connection a late sibling query is refused and the connection is reused clean', async () => {
+    await withScenario('s7a', async s => {
+      const app = appStore(s, 'hv-f2');
+      try {
+        let sibling: Promise<unknown> = Promise.resolve();
+        const r = await settle(app.sql.transaction(async tx => {
+          const denied = tx.query('SELECT * FROM auth_audit_events'); // permission denied for the runtime role
+          sibling = (async () => { await sleep(50); return tx.query('SELECT current_user AS c'); })();
+          await Promise.all([denied, sibling]);
+        }));
+        expect(r.ok).toBe(false);
+        await expect(sibling).rejects.toBeInstanceOf(TransactionClosedError);
+        const state = (await s.mon.query(`SELECT state FROM pg_stat_activity WHERE datname = current_database() AND application_name = 'hv-f2'`)).rows[0];
+        expect(state.state).toBe('idle'); // not "idle in transaction": ROLLBACK completed, nothing left open
+        expect((await app.pool.query<{ c: string; s: string }>('SELECT current_user AS c, session_user AS s')).rows[0]).toEqual({ c: 'netlifydb_owner', s: 'netlifydb_owner' });
+        expect((await app.sql.query<{ c: string }>('SELECT current_user AS c')).rows[0]!.c).toBe('hourvia_auth_runtime');
+      } finally { await app.pool.end(); }
+    });
+  });
+
+  it('7b. F-2: an un-awaited failing write rolls the whole transaction back and is reported as a failure', async () => {
+    await withScenario('s7b', async s => {
+      const app = appStore(s, 'hv-f2b');
+      const hex = 'b'.repeat(64);
+      try {
+        // Background fact the lifecycle defends against: COMMIT of an aborted transaction "succeeds" with tag ROLLBACK.
+        await s.b.query('BEGIN'); await s.b.query('SELECT 1/0').catch(() => undefined);
+        expect((await s.b.query('COMMIT') as unknown as { command: string }).command).toBe('ROLLBACK');
+        const r = await settle(app.sql.transaction(async tx => {
+          await tx.query(`INSERT INTO auth_rate_limits (bucket, window_start, hits) VALUES ($1, now(), 1)`, [`rehearsal:${hex}`]);
+          void tx.query(`INSERT INTO auth_rate_limits (bucket, window_start, hits) VALUES ($1, now(), 0)`, [`rehearsal:${hex}`]).catch(() => undefined); // violates hits > 0
+          return 'would have reported success';
+        }));
+        log('7b:', JSON.stringify(r));
+        expect(r.ok).toBe(false);
+        expect((await s.mon.query(`SELECT count(*)::int n FROM auth_rate_limits`)).rows[0].n).toBe(0);
+      } finally { await app.pool.end(); }
     });
   });
 });

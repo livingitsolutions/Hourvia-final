@@ -25,18 +25,26 @@ export class SqlStatementRejectedError extends Error {
 const ALLOWED_FIRST_KEYWORD = /^(SELECT|INSERT|UPDATE)\b/i;
 
 /**
- * Sprint 1.9C: application statement policy, enforced before anything reaches the database.
+ * Application statement policy (Sprint 1.9C, corrected in 1.9C.1), enforced before anything reaches the database.
  *
  * The session user is netlifydb_owner, so a statement that reached the database with RESET ROLE, SET ROLE or
  * set_config('role', …) would leave the restricted role inside the very transaction roleScopedSqlClient opened.
- * Store SQL is fixed text and never does this; this guard makes that a checked invariant instead of a convention:
+ * Store SQL is fixed text and never does this; this guard makes that a checked invariant instead of a convention.
+ * Every rule is a conservative scan of the WHOLE text (including anything inside string literals), so quoting cannot
+ * hide a token from it:
  *   * one statement only (no ";"), so nothing can be appended after a legitimate statement;
- *   * no SQL comments, so nothing can be hidden from review or from this check;
+ *   * no SQL comments ("--", "/*"), so nothing can be hidden from review or from this check;
+ *   * no double quotes and no U& escapes: quoted or Unicode-escaped identifiers ("set_config", U&"set\005fconfig")
+ *     are the only way to spell a function or relation name that the token rules below would not see. Store SQL uses
+ *     neither, so a quoted identifier is never needed;
  *   * it must start with SELECT, INSERT or UPDATE, which excludes SET/RESET ROLE, SET SESSION AUTHORIZATION,
- *     transaction control, DISCARD, DO, CALL, COPY and DDL;
- *   * set_config() is refused anywhere, because it can change role and search_path from inside a SELECT.
- * Parameters are sent separately and are not inspected. Violations throw, so the request fails closed (HTTP 503).
+ *     transaction control, DISCARD, DO, CALL, COPY, EXPLAIN, WITH and DDL;
+ *   * "set_config" and "pg_settings" are refused anywhere, in any case, with or without a schema prefix or
+ *     parenthesis: set_config() changes role and search_path from inside a SELECT, and UPDATE pg_settings calls it.
+ * Parameters are sent separately and are not inspected. Violations throw before the database is contacted, so the
+ * request fails closed (HTTP 503).
  *
+ * This is a lexical rule set, not a SQL parser. It does not protect against code execution inside the Function.
  * Applied to the store only. The test harness also probes the raw role-scoped client to prove the database itself
  * denies what this guard blocks earlier.
  */
@@ -44,8 +52,11 @@ export function assertAllowedStatement(text: string): void {
   const sql = text.trim();
   if (sql.includes(';')) throw new SqlStatementRejectedError('multiple_statements');
   if (sql.includes('--') || sql.includes('/*')) throw new SqlStatementRejectedError('comment');
+  if (sql.includes('"')) throw new SqlStatementRejectedError('quoted_identifier');
+  if (/u&/i.test(sql)) throw new SqlStatementRejectedError('unicode_escape');
   if (!ALLOWED_FIRST_KEYWORD.test(sql)) throw new SqlStatementRejectedError('statement_kind');
-  if (/\bset_config\s*\(/i.test(sql)) throw new SqlStatementRejectedError('set_config');
+  if (/set_config/i.test(sql)) throw new SqlStatementRejectedError('set_config');
+  if (/pg_settings/i.test(sql)) throw new SqlStatementRejectedError('pg_settings');
 }
 
 export function statementGuardedSqlClient(inner: SqlClient): SqlClient {

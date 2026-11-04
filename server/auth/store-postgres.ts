@@ -122,6 +122,12 @@ export class PostgresAuthStore implements AuthStore {
 
   acceptInvitation(memberId: string, now: Date) {
     return this.sql.transaction(async tx => {
+      // Sprint 1.9C.1 lock order, shared by every membership write (upsertInvitation, disableMember, this): the
+      // workspace_members row first, then its invitations. Without it, accept (invitation → member) and disable
+      // (member → invitation) on the same member could deadlock. FOR NO KEY UPDATE is the lock the activation UPDATE
+      // below takes anyway, so foreign-key inserts that reference the member (sessions, audit) are not blocked.
+      const locked = await tx.query(`SELECT id FROM workspace_members WHERE workspace_id = $1 AND id = $2 FOR NO KEY UPDATE`, [WORKSPACE_ID, memberId]);
+      if (locked.rows.length !== 1) return false;
       const accepted = await tx.query(
         `UPDATE workspace_invitations SET status = 'accepted', accepted_at = $3
          WHERE workspace_id = $1 AND member_id = $2 AND status = 'pending' AND expires_at > $3 RETURNING id`, [WORKSPACE_ID, memberId, now]);
