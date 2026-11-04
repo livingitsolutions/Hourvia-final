@@ -1,4 +1,4 @@
-import type { AcceptInvitationInput, AccountAccess, AdminInviteInput, Authentication, RecoveryCompleteInput } from '../domain/contracts';
+import type { AcceptInvitationInput, AccountAccess, AdminInviteInput, Authentication, MemberRoleChangeInput, RecoveryCompleteInput } from '../domain/contracts';
 import type { Principal } from '../domain/permissions';
 
 /**
@@ -47,6 +47,7 @@ export function createWorkspaceAdminApi(fetcher: Fetch = (...args) => fetch(...a
     async invite(input: AdminInviteInput) { return (await call<{ member: WorkspaceMember }>(fetcher, '/api/admin/invitations', input)).member; },
     async disable(id: string) { await call(fetcher, `/api/admin/members/${encodeURIComponent(id)}/disable`, {}); },
     async revokeSessions(id: string) { await call(fetcher, `/api/admin/members/${encodeURIComponent(id)}/revoke-sessions`, {}); },
+    async changeRole(id: string, role: MemberRoleChangeInput['role']) { return (await call<{ member: WorkspaceMember }>(fetcher, `/api/admin/members/${encodeURIComponent(id)}/role`, { role })).member; },
   };
 }
 export type WorkspaceAdminApi = ReturnType<typeof createWorkspaceAdminApi>;

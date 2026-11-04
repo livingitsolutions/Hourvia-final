@@ -15,9 +15,16 @@ export const recoveryCompleteSchema = z.union([
 export type RecoveryCompleteInput = z.infer<typeof recoveryCompleteSchema>;
 export const acceptInvitationSchema = z.object({ tokenHash: tokenHashSchema, password: passwordSchema });
 export type AcceptInvitationInput = z.infer<typeof acceptInvitationSchema>;
-/** Admins may invite only Managers and Contractors. Workspace is fixed server-side and never accepted here. */
-export const adminInviteSchema = z.object({ email: z.email('Enter a valid work email address.').max(320), role: z.enum(['workspace_manager', 'contractor']), displayName: z.string().trim().max(120).optional() });
+/**
+ * Organization roles the application can grant. Platform privileges (platform_super_admin) and the withdrawn
+ * workspace super_admin are never accepted. Which of these the caller may grant is decided server-side by
+ * assignableRoles(). Workspace is fixed server-side and never accepted here.
+ */
+export const assignableRoleSchema = z.enum(['workspace_admin', 'workspace_manager', 'contractor'], 'Choose a valid role.');
+export const adminInviteSchema = z.object({ email: z.email('Enter a valid work email address.').max(320), role: assignableRoleSchema, displayName: z.string().trim().max(120).optional() });
 export type AdminInviteInput = z.infer<typeof adminInviteSchema>;
+export const memberRoleChangeSchema = z.object({ role: assignableRoleSchema });
+export type MemberRoleChangeInput = z.infer<typeof memberRoleChangeSchema>;
 export interface AccountAccess { requestRecovery(email: string): Promise<string>; completeRecovery(input: RecoveryCompleteInput): Promise<string>; acceptInvitation(input: AcceptInvitationInput): Promise<string> }
 export const taskSchema = z.enum(['Working', 'Break', 'Lunch']);
 export const shiftStartSchema = z.object({ projectId: z.string().trim().min(1), description: z.string().trim().min(1) });

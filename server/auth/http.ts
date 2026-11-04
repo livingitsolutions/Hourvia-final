@@ -55,6 +55,7 @@ const routes: { method: 'GET' | 'POST'; pattern: RegExp; run(s: AuthService, met
   { method: 'POST', pattern: /^\/api\/admin\/invitations$/, run: (s, m, b) => s.invite(b, m) },
   { method: 'POST', pattern: /^\/api\/admin\/members\/([^/]+)\/disable$/, run: (s, m, _b, x) => s.disableMember(x[1]!, m) },
   { method: 'POST', pattern: /^\/api\/admin\/members\/([^/]+)\/revoke-sessions$/, run: (s, m, _b, x) => s.revokeMemberSessions(x[1]!, m) },
+  { method: 'POST', pattern: /^\/api\/admin\/members\/([^/]+)\/role$/, run: (s, m, b, x) => s.changeMemberRole(x[1]!, b, m) },
 ];
 
 export async function handleAuthRequest(req: Request, ip: string | undefined, makeDeps: DepsFactory): Promise<Response> {

@@ -41,10 +41,11 @@ Browser (React)                 Netlify Function auth-api               Supabase
 | POST `/api/auth/recovery/request` | anyone | Always the same 202 response, padded to at least 750 ms; emails only active members; 3 per email and 10 per IP per hour |
 | POST `/api/auth/recovery/complete` | anyone | `{email, code, password}` or `{tokenHash, password}`; 5 per email and 20 per IP per hour; revokes all sessions |
 | POST `/api/auth/invitations/accept` | invitee | `{tokenHash, password}`; must match a pending, unexpired invitation bound to the same Supabase user |
-| GET `/api/admin/members` | Admin | Members list (no provider IDs) |
-| POST `/api/admin/invitations` | Admin | Invites `workspace_manager` or `contractor` only; requires `HOURVIA_EMAIL_DELIVERY_AUTHORIZED=true` |
-| POST `/api/admin/members/:id/disable` | Admin | Disables the member, revokes all sessions, bans the Supabase user; admins can't disable themselves |
-| POST `/api/admin/members/:id/revoke-sessions` | Admin | Ends all sessions for a member |
+| GET `/api/admin/members` | Administrator | Members list (no provider IDs) |
+| POST `/api/admin/invitations` | Administrator | Invites `workspace_manager` or `contractor`; `workspace_admin` also requires the caller's **Platform Super Admin** privilege. Platform privileges are never accepted. Requires `HOURVIA_EMAIL_DELIVERY_AUTHORIZED=true` |
+| POST `/api/admin/members/:id/role` | Administrator | `{role}`; changes an active member's organization role within the caller's authority (see [auth-platform-super-admin.md](auth-platform-super-admin.md)) |
+| POST `/api/admin/members/:id/disable` | Administrator | Disables the member, revokes all sessions (attributed to the caller), bans the Supabase user; nobody can disable themselves; disabling an Administrator requires the Platform Super Admin privilege |
+| POST `/api/admin/members/:id/revoke-sessions` | Administrator | Ends all sessions for a member within the caller's authority (anyone with access may end their own); every revocation records the acting member |
 
 There is no signup endpoint.
 
@@ -91,7 +92,7 @@ The schema is staged at `db/proposals/sprint-1.7-auth/001_create_auth_foundation
 - Members and invitations: INSERT, UPDATE, and SELECT.
 - No DELETE or DDL is needed. Triggers also block UPDATE, DELETE, and TRUNCATE on audit events.
 
-The first Admin is bootstrapped with the reviewed `bootstrap-first-admin.sql.example`. Expired session and rate-limit rows can be pruned by a later scheduled job.
+The first Admin is bootstrapped with the reviewed `bootstrap-first-admin.sql.example`. The platform-scoped Platform Super Admin privilege, its database guards and its operator procedures are described in [auth-platform-super-admin.md](auth-platform-super-admin.md). Future multi-tenant, seat and PWA design is in [saas-pwa-architecture.md](saas-pwa-architecture.md). Expired session and rate-limit rows can be pruned by a later scheduled job.
 
 ## Tests
 
