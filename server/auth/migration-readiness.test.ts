@@ -201,7 +201,9 @@ describe('restricted runtime role is the only path for auth SQL, and it fails cl
   it('production wiring wraps the platform pool with roleScopedSqlClient and nothing else touches the database', () => {
     const read = (p: string) => readFileSync(fileURLToPath(new URL(p, import.meta.url)), 'utf8');
     const runtime = read('./runtime.ts');
-    expect(runtime).toMatch(/new PostgresAuthStore\(roleScopedSqlClient\(poolSqlClient\(getDatabase\(\)\.pool/);
+    expect(runtime).toMatch(/new PostgresAuthStore\(statementGuardedSqlClient\(roleScopedSqlClient\(poolSqlClient\(platformPool\(\)\)\)\)\)/);
+    expect(runtime).toMatch(/const pool = getDatabase\(\)\.pool/);
+    expect(runtime.match(/new PostgresAuthStore\(/g)).toHaveLength(1);
     expect(runtime.match(/getDatabase\(/g)).toHaveLength(1);
     expect(read('./sql-role.ts')).toMatch(/AUTH_DB_ROLE = 'hourvia_auth_runtime'/);
     expect(read('../../netlify/functions/auth-api.mts')).not.toMatch(/getDatabase|@netlify\/database/);

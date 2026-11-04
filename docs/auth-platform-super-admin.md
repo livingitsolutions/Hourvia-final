@@ -157,3 +157,21 @@ A read-only console for the active Platform Super Admin. Grant, revoke and reins
 
 **Tests** (`server/auth/platform-security.test.ts`). Each attack runs in a fresh PGlite database, as `hourvia_auth_runtime`, inside a transaction that is always rolled back. It is shown succeeding without `20261104160000` and failing with it. Other tests cover catalog preservation, the self-check's abort paths, applying over a live holder without changing data, and every rate-limit path.
 
+
+## 9. Runtime hardening (Sprint 1.9C, code only)
+
+No migration, role, grant, credential or environment variable changed. Authorization semantics are unchanged.
+
+- **Store statement policy.** The store's client is now `statementGuardedSqlClient(roleScopedSqlClient(poolSqlClient(pool)))` (`server/auth/sql-role.ts`). Before a statement reaches the database it must:
+  - be a single statement (no `;`) with no SQL comments;
+  - start with `SELECT`, `INSERT` or `UPDATE`;
+  - not call `set_config()`.
+
+  This blocks `RESET ROLE`, `SET ROLE`, `SET SESSION AUTHORIZATION`, transaction control, `DO`, `COPY` and DDL from the application path. A violation fails the request closed (503). The guard is lexical defence in depth on top of fixed-text, parameterized SQL. It does not protect against code execution inside the Function (section 5).
+- **Pooled connections.**
+  - A transaction handle is closed when its transaction ends. A stale handle can therefore never run SQL as the owner session user on a connection back in the pool.
+  - A connection whose `ROLLBACK` fails is destroyed instead of being reused.
+  - Idle-client pool errors are logged instead of crashing the instance.
+- **Atomic disable.** `disableMember` changes the member status and revokes pending invitations in one transaction.
+- **HTTP.** Bodies whose declared size is over 8 KB, and broken request streams, are rejected with 400. Fail-closed 503s log only the error class and SQLSTATE code (`hourvia_auth_error`), never the message.
+- **Tests.** `server/auth/runtime-hardening.test.ts`. The harness store uses the same guard as production. `h.sql` stays raw so tests can still prove what the database itself denies.

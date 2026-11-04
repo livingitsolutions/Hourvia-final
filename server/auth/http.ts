@@ -1,5 +1,6 @@
 import { AuthService, type Outcome, type RequestMeta } from './service';
 import type { AuthDeps } from './types';
+import { logDatabaseError } from './runtime-log';
 
 export const SESSION_COOKIE = '__Host-hourvia_session';
 const MAX_BODY_BYTES = 8 * 1024;
@@ -43,7 +44,11 @@ function sameOriginRead(req: Request): boolean {
   return (origin === null || origin === new URL(req.url).origin) && (site === null || site === 'same-origin');
 }
 async function readJson(req: Request): Promise<{ value: unknown } | null> {
-  const text = await req.text();
+  // Refuse a declared oversize body before buffering it; the decoded length is still checked below.
+  const declared = Number(req.headers.get('content-length') ?? '0');
+  if (!Number.isFinite(declared) || declared > MAX_BODY_BYTES) return null;
+  let text: string;
+  try { text = await req.text(); } catch { return null; } // aborted or broken request stream
   if (new TextEncoder().encode(text).length > MAX_BODY_BYTES) return null;
   try { return { value: JSON.parse(text) as unknown }; } catch { return null; }
 }
@@ -93,8 +98,10 @@ export async function handleAuthRequest(req: Request, ip: string | undefined, ma
     if (deps.config.appOrigin && new URL(req.url).origin !== deps.config.appOrigin) return error(421, 'wrong_origin', 'Open Hourvia at its main address to sign in.');
     const meta: RequestMeta = { ip: ip || 'unknown', sessionToken: readSessionCookie(req.headers.get('cookie')) };
     return respond(await found.route.run(new AuthService(deps), meta, body, found.match!, url));
-  } catch {
-    // Missing tables, database or provider outages: fail closed without leaking internals.
+  } catch (failure) {
+    // Missing tables, database or provider outages: fail closed without leaking internals. Only the error class and
+    // SQLSTATE code are logged, never the message.
+    logDatabaseError('request', failure);
     return error(503, 'auth_unavailable', 'Workspace sign-in is temporarily unavailable. Contact your workspace administrator.');
   }
 }

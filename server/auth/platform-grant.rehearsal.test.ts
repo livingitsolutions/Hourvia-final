@@ -13,7 +13,7 @@ import { resolve } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { handleAuthRequest } from './http';
 import { poolSqlClient } from './runtime';
-import { roleScopedSqlClient } from './sql-role';
+import { roleScopedSqlClient, statementGuardedSqlClient } from './sql-role';
 import { PostgresAuthStore } from './store-postgres';
 import { FakeSupabase, GRANT_PLATFORM_SQL, ORIGIN, PLATFORM_EMAIL, PLATFORM_ROLES_SQL, PLATFORM_SQL, ROLE_SQL, SCHEMA_SQL, SUPER_ADMIN_SQL, fillOperatorSql } from './testing/harness';
 import type { AuthConfig, AuthDeps } from './types';
@@ -311,7 +311,7 @@ describe.skipIf(!enabled)('AP-PSA-GRANT rehearsal on a disposable PostgreSQL 18 
       const pool = new pg.Pool({ host: SOCKET, port: PORT, user: 'netlifydb_owner', database: s.db, max: 2 });
       try {
         const config: AuthConfig = { hashKey: 'k'.repeat(48), appOrigin: ORIGIN, emailDeliveryAuthorized: true, idleTimeoutSeconds: 1800, absoluteTimeoutSeconds: 43200, invitationTtlSeconds: 7 * 86400, recoveryMinimumMs: 0, smokeTestEmails: null };
-        const deps: AuthDeps = { store: new PostgresAuthStore(roleScopedSqlClient(poolSqlClient(pool as any))), provider, config, now: () => new Date(), sleep: async () => undefined };
+        const deps: AuthDeps = { store: new PostgresAuthStore(statementGuardedSqlClient(roleScopedSqlClient(poolSqlClient(pool as any)))), provider, config, now: () => new Date(), sleep: async () => undefined };
         const call = async (method: 'GET' | 'POST', path: string, cookie?: string, body?: unknown) => {
           const headers: Record<string, string> = method === 'POST' ? { origin: ORIGIN, 'content-type': 'application/json' } : {};
           if (cookie) headers.cookie = `__Host-hourvia_session=${cookie}`;

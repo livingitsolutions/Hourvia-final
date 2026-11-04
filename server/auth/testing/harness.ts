@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { PGlite } from '@electric-sql/pglite';
 import { handleAuthRequest } from '../http';
-import { roleScopedSqlClient } from '../sql-role';
+import { roleScopedSqlClient, statementGuardedSqlClient } from '../sql-role';
 import { PostgresAuthStore } from '../store-postgres';
 import { ProviderConflictError, type AuthConfig, type AuthDeps, type IdentityProvider, type OtpVerification, type SqlClient } from '../types';
 
@@ -127,7 +127,8 @@ export async function createHarness(options: { schema?: boolean; restrictedRole?
   const clock = { now: options.now ?? new Date('2026-11-03T10:00:00Z') };
   const sleeps: number[] = [];
   const config: AuthConfig = { hashKey: 'k'.repeat(48), appOrigin: ORIGIN, emailDeliveryAuthorized: true, idleTimeoutSeconds: 1800, absoluteTimeoutSeconds: 43200, invitationTtlSeconds: 7 * 86400, recoveryMinimumMs: 750, smokeTestEmails: null, ...options.config };
-  const deps: AuthDeps = { store: new PostgresAuthStore(sql), provider, config, now: () => new Date(clock.now), sleep: async ms => { sleeps.push(ms); } };
+  // The store goes through the same statement policy as production; h.sql stays raw so tests can probe the database.
+  const deps: AuthDeps = { store: new PostgresAuthStore(statementGuardedSqlClient(sql)), provider, config, now: () => new Date(clock.now), sleep: async ms => { sleeps.push(ms); } };
   const advance = (seconds: number) => { clock.now = new Date(clock.now.getTime() + seconds * 1000); };
 
   async function call(method: 'GET' | 'POST', path: string, init: { body?: unknown; cookie?: string | null; headers?: Record<string, string>; ip?: string } = {}) {

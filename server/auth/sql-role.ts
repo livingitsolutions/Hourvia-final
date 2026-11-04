@@ -16,3 +16,45 @@ export function roleScopedSqlClient(inner: SqlClient): SqlClient {
     transaction: <T>(fn: (tx: SqlClient) => Promise<T>) => inner.transaction(async tx => fn(await enter(tx))),
   };
 }
+
+export class SqlStatementRejectedError extends Error {
+  constructor(reason: string) { super(`sql_statement_rejected:${reason}`); this.name = 'SqlStatementRejectedError'; }
+}
+
+/** The only statement kinds the auth store issues. DELETE, TRUNCATE, DDL, SET/RESET, DO, COPY and CALL never are. */
+const ALLOWED_FIRST_KEYWORD = /^(SELECT|INSERT|UPDATE)\b/i;
+
+/**
+ * Sprint 1.9C: application statement policy, enforced before anything reaches the database.
+ *
+ * The session user is netlifydb_owner, so a statement that reached the database with RESET ROLE, SET ROLE or
+ * set_config('role', …) would leave the restricted role inside the very transaction roleScopedSqlClient opened.
+ * Store SQL is fixed text and never does this; this guard makes that a checked invariant instead of a convention:
+ *   * one statement only (no ";"), so nothing can be appended after a legitimate statement;
+ *   * no SQL comments, so nothing can be hidden from review or from this check;
+ *   * it must start with SELECT, INSERT or UPDATE, which excludes SET/RESET ROLE, SET SESSION AUTHORIZATION,
+ *     transaction control, DISCARD, DO, CALL, COPY and DDL;
+ *   * set_config() is refused anywhere, because it can change role and search_path from inside a SELECT.
+ * Parameters are sent separately and are not inspected. Violations throw, so the request fails closed (HTTP 503).
+ *
+ * Applied to the store only. The test harness also probes the raw role-scoped client to prove the database itself
+ * denies what this guard blocks earlier.
+ */
+export function assertAllowedStatement(text: string): void {
+  const sql = text.trim();
+  if (sql.includes(';')) throw new SqlStatementRejectedError('multiple_statements');
+  if (sql.includes('--') || sql.includes('/*')) throw new SqlStatementRejectedError('comment');
+  if (!ALLOWED_FIRST_KEYWORD.test(sql)) throw new SqlStatementRejectedError('statement_kind');
+  if (/\bset_config\s*\(/i.test(sql)) throw new SqlStatementRejectedError('set_config');
+}
+
+export function statementGuardedSqlClient(inner: SqlClient): SqlClient {
+  const guard = (client: SqlClient): SqlClient => ({
+    query: <T = Record<string, unknown>>(text: string, params?: unknown[]) => {
+      try { assertAllowedStatement(text); } catch (error) { return Promise.reject(error); }
+      return client.query<T>(text, params);
+    },
+    transaction: <T>(fn: (tx: SqlClient) => Promise<T>) => client.transaction(tx => fn(guard(tx))),
+  });
+  return guard(inner);
+}
