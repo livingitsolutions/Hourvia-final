@@ -244,6 +244,9 @@ describe('G-2b (Sprint 1.9C.1, gate finding F-2): handles close when the callbac
     await sql.transaction(async tx => {
       await tx.query('SELECT 1');
       late = pause(1).then(() => tx.query('SELECT late'));
+      // The rejection is intentional and settles before the assertion below attaches. Mark it handled now so
+      // Vitest does not report an unhandled rejection; `expect(late).rejects` still asserts on the same promise.
+      late.catch(() => undefined);
     });
     await expect(late).rejects.toBeInstanceOf(TransactionClosedError);
     await pause(20);
@@ -257,6 +260,9 @@ describe('G-2b (Sprint 1.9C.1, gate finding F-2): handles close when the callbac
     await expect(sql.transaction(async tx => {
       await tx.query('SELECT 1');
       late = pause(1).then(() => tx.query('SELECT late'));
+      // The rejection is intentional and settles before the assertion below attaches. Mark it handled now so
+      // Vitest does not report an unhandled rejection; `expect(late).rejects` still asserts on the same promise.
+      late.catch(() => undefined);
       throw new Error('app');
     })).rejects.toThrow('app');
     await expect(late).rejects.toBeInstanceOf(TransactionClosedError);
