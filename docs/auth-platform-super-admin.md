@@ -65,16 +65,20 @@ Each procedure is owner SQL that needs its own written approval. Each one locks,
 
 | Procedure | Approval | Effect |
 | --- | --- | --- |
-| `grant-platform-super-admin.sql` | AP-PSA-GRANT | Verifies that the UID **and** the member ID match the active, activated Living IT Solutions membership. Writes the designation on the first run. Inserts the grant. A re-run while the grant is active writes nothing. After a revocation, a new run with a new approval reinstates it. |
+| `grant-platform-super-admin.sql` | AP-PSA-GRANT | Locks the Living IT Solutions membership row (`SELECT … FOR UPDATE`), then verifies that the UID **and** the member ID match it, that it is `active` and activated, and that its role is `workspace_admin` (Administrator). A Manager or Contractor membership is refused and nothing is written. Writes the designation on the first run. Inserts the grant. A re-run while the grant is active writes nothing. After a revocation, a new run with a new approval reinstates it. |
 | `revoke-platform-super-admin.sql` | AP-PSA-REVOKE | Revokes the active grant, with a reason. Optionally ends every session of that identity, audited as `operator`. Doesn't change the membership. Re-running it is a no-op. |
 | `reinstate-disabled-member.sql` | AP-MEMBER-REINSTATE | Restores a member who was disabled in error to `active`, with the **same** role. Unban the Supabase user first, under the same approval. Doesn't restore ended sessions and doesn't grant any privilege. |
 
 Changing the designated UID, for example if the Supabase identity is permanently lost, deliberately needs a reviewed forward migration. Membership identity is also immutable, so a new identity for the same mailbox needs a reviewed procedure in any case.
 
 **Grant run sheet** (production only, after the release prerequisites in the change record):
-1. **Q1, read-only:** `SELECT id, auth_user_id, role, status, activated_at IS NOT NULL AS activated FROM workspace_members WHERE email = 'livingitsolutions@gmail.com';` Expect one row that is `active` and activated. Copy `id` and `auth_user_id`; don't type them.
+1. **Q1, read-only:** `SELECT id, auth_user_id, role, status, activated_at IS NOT NULL AS activated FROM workspace_members WHERE email = 'livingitsolutions@gmail.com';` Expect exactly one row with `role = 'workspace_admin'`, `status = 'active'` and `activated = true`. **Stop if the role is anything other than `workspace_admin`.** The grant refuses it (`grant_guard: the membership role is …, not workspace_admin`), and changing the role is a separate, separately approved application action, never part of this procedure. Copy `id` and `auth_user_id`; don't type them.
 2. **Q2, read-only:** `SELECT count(*) FROM platform_privileges WHERE revoked_at IS NULL;` Expect `0`.
 3. Run the grant procedure with the three placeholders replaced. Expect the notice `platform_super_admin_granted`.
+   - Run it as a single statement, outside any explicit transaction you opened yourself, so that it commits or rolls back on its own.
+   - Don't change the Living IT Solutions membership (role, status, sessions) while the procedure runs. The procedure holds the row lock until it commits, and a conflicting change waits for it. If the procedure can't take its locks within 5 seconds, it fails with a lock timeout and writes nothing. Re-run Q1 and Q2, then retry.
+   - Any `grant_input`, `grant_guard` or `grant_selfcheck` error means the whole run rolled back: no designation, no grant and no audit row. Re-run Q1 before deciding what to do next.
+   - Lock order, shared with the other procedures: designation table, then `platform_privileges`, then the membership row, then sessions and audit. Don't run ad-hoc SQL that locks these in a different order while a procedure is running.
 4. **Verify:**
    - `SELECT event_type FROM platform_audit_events ORDER BY id;` should return `platform_designation_set` and `platform_privilege_granted`.
    - The membership role is still `workspace_admin`.
