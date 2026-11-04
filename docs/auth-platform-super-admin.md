@@ -157,3 +157,54 @@ A read-only console for the active Platform Super Admin. Grant, revoke and reins
 
 **Tests** (`server/auth/platform-security.test.ts`). Each attack runs in a fresh PGlite database, as `hourvia_auth_runtime`, inside a transaction that is always rolled back. It is shown succeeding without `20261104160000` and failing with it. Other tests cover catalog preservation, the self-check's abort paths, applying over a live holder without changing data, and every rate-limit path.
 
+
+## 9. Runtime hardening (Sprint 1.9C, corrected in Sprint 1.9C.1; code only)
+
+No migration, role, grant, credential or environment variable changed. Authorization semantics are unchanged. Sprint 1.9C.1 corrected three gate findings: F-1 (a policy bypass), F-2 (a transaction-handle window) and F-3 (a lock-order deadlock).
+
+**Statement policy** (`server/auth/sql-role.ts`)
+- **Scope.** The store's client is `statementGuardedSqlClient(roleScopedSqlClient(poolSqlClient(pool)))`, so every store statement passes the policy before it reaches the database. The policy scans the whole statement text, string literals included, so quoting can't hide a token.
+- **A statement is rejected if it:**
+  - contains `;`, so only one statement is allowed;
+  - contains `--` or `/*`;
+  - contains a double quote or a `U&` escape. Quoted or Unicode-escaped identifiers, such as `"set_config"`, were the 1.9C bypass, and store SQL uses neither;
+  - doesn't start with `SELECT`, `INSERT` or `UPDATE`;
+  - mentions `set_config` or `pg_settings` anywhere, in any case. `UPDATE pg_settings` calls `set_config` internally.
+- **Failure mode.** A violation throws before the database is contacted, and the request returns 503. Tests prove the rejected statement never reaches the client, both in `query()` and inside `transaction()`.
+- **Limits.**
+  - It is a lexical rule set, not a SQL parser. It is defence in depth on top of fixed-text, parameterized SQL.
+  - It does not protect against code execution inside the Function (section 5).
+  - New store SQL must not use quoted identifiers, comments or semicolons; such SQL would fail closed.
+
+**Transaction lifecycle** (`poolSqlClient` in `server/auth/runtime.ts`)
+1. `BEGIN`, then the callback runs with a transaction handle.
+2. The handle closes the moment the callback settles, before `COMMIT` or `ROLLBACK` is sent. After that, every `tx.query` is rejected with `TransactionClosedError` and never reaches the connection. This covers:
+   - delayed timers;
+   - detached continuations;
+   - a sibling `Promise` branch still running after another branch threw;
+   - retained references.
+3. Queries the callback started but didn't await are drained first. If one of them failed, the transaction rolls back and the error is thrown.
+4. A `COMMIT` that the server reports as `ROLLBACK` (an already-aborted transaction) is treated as a failure.
+5. If `ROLLBACK` itself fails, the connection is destroyed rather than returned to the pool. The original error is reported.
+
+As before, `SET LOCAL ROLE` reverts at `COMMIT` or `ROLLBACK`. Tests on one reused physical connection show it never carries over to the next checkout.
+
+**Lock order for membership writes** (`server/auth/store-postgres.ts`)
+- **The order.** The `workspace_members` row is locked first, then its invitations. This holds for `upsertInvitation`, `disableMember` (whose status change and invitation revocation are one transaction) and `acceptInvitation`.
+- **The change.** `acceptInvitation` now starts with `SELECT … FOR NO KEY UPDATE` on the member row. That is the same lock its activation `UPDATE` already took, so foreign-key inserts that reference the member are not blocked.
+- **Effect.** A concurrent accept and disable on the same member now serialize instead of deadlocking.
+- **Outcomes.**
+  - Disable first: the invitation is revoked and the acceptance is refused.
+  - Accept first: the member is activated, then disabled.
+  - Each status change is audited by the database as before.
+- **Not changed.** Acceptance, revocation and audit semantics. Operator procedures lock in their own documented order (section 4) and don't write invitations.
+
+**HTTP** (`server/auth/http.ts`, `server/auth/runtime-log.ts`)
+- A declared body over 8 KB, a malformed `Content-Length` or a broken request stream gets 400.
+- Internal failures get a generic 503 and log one `hourvia_auth_error` line with only the error class and SQLSTATE code. The message is never logged.
+- An idle pool-client error is logged instead of crashing the Function instance.
+
+**Verification**
+- **Unit and integration tests** (`server/auth/runtime-hardening.test.ts`): run with PGlite for single-connection semantics. The harness store uses the same policy as production, and `h.sql` stays raw so tests can still prove what the database itself denies.
+- **Real concurrency** (`server/auth/platform-grant.rehearsal.test.ts`, tests 6a–6c and 7a–7b): run on a disposable PostgreSQL 18 cluster with `bash scripts/rehearsal/platform-grant-rehearsal.sh`. The template now applies all six applied migrations.
+- **Regression proof.** Against the previous `acceptInvitation`, tests 6b and 6c reproduce a real `40P01 deadlock detected`, and 6a shows accept holding the invitation lock first.
