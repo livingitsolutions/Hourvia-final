@@ -6,7 +6,8 @@
 // M-1: platform request limits are checked before denial auditing and before audit-page reads.
 import { describe, expect, it } from 'vitest';
 import { PLATFORM_LIMITS } from './service';
-import { SEARCH_PATH_SQL, applyMigration, createHarness, type Harness } from './testing/harness';
+import { sha256Hex } from './crypto';
+import { ORGANIZATIONS_SQL, SEARCH_PATH_SQL, applyMigration, createHarness, type Harness } from './testing/harness';
 
 const ROLLBACK = 'rollback-attack';
 /** Runs fn as hourvia_auth_runtime (SET LOCAL ROLE) and always rolls back. */
@@ -113,7 +114,8 @@ describe('H-1 regression: temporary-table shadowing', () => {
 
   it('preserves signatures, SECURITY DEFINER flags, ownership and EXECUTE grants, and pins pg_temp last everywhere', async () => {
     const before = await createHarness({ searchPathFix: false });
-    const after = await createHarness();
+    // Sprint 2.0B: compare against the database as 20261104160000 left it (M7 adds one function; its own test covers it).
+    const after = await createHarness({ organizations: false });
     const catalog = (h: Harness) => h.pg.query<{ f: string; secdef: boolean; vol: string; owner: string; acl: string | null; body: string; config: string[] | null }>(
       `SELECT p.oid::regprocedure::text AS f, p.prosecdef AS secdef, p.provolatile AS vol, pg_get_userbyid(p.proowner) AS owner, p.proacl::text AS acl, p.prosrc AS body, p.proconfig AS config
        FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace AND p.proname LIKE 'hourvia\\_%' ORDER BY 1`);
@@ -142,12 +144,16 @@ describe('H-1 regression: temporary-table shadowing', () => {
   it('changes no row when applied over a live holder, and existing sessions keep working', async () => {
     const h = await createHarness({ now: new Date(), searchPathFix: false });
     const s = await h.seedPlatformSuperAdmin();
-    const cookie = (await h.login(s.email)).cookie!;
+    // Sprint 2.0B: the current store needs M7, which requires 20261104160000, so the pre-existing session is created the
+    // way the 799f042 store creates one (same INSERT, same column list) instead of through a login.
+    const cookie = 'S'.repeat(43);
+    await h.sql.query(`INSERT INTO auth_sessions (token_hash, member_id, created_at, last_seen_at, idle_expires_at, absolute_expires_at) VALUES ($1, $2, now(), now(), now() + interval '30 minutes', now() + interval '12 hours')`, [sha256Hex(cookie), s.id]);
     const snapshot = async () => (await h.pg.query(`SELECT (SELECT json_agg(m ORDER BY m.id) FROM workspace_members m) AS m, (SELECT json_agg(p ORDER BY p.id) FROM platform_privileges p) AS p,
       (SELECT json_agg(e ORDER BY e.id) FROM platform_audit_events e) AS e, (SELECT json_agg(a ORDER BY a.id) FROM auth_audit_events a) AS a, (SELECT json_agg(x ORDER BY x.id) FROM auth_sessions x) AS s`)).rows[0];
     const before = await snapshot();
     await applyMigration(h.pg, SEARCH_PATH_SQL);
     expect(await snapshot()).toEqual(before);
+    await applyMigration(h.pg, ORGANIZATIONS_SQL);
     expect((await h.call('GET', '/api/platform/overview', { cookie })).status).toBe(200);
     expect((await h.call('GET', '/api/admin/members', { cookie })).status).toBe(200);
   });

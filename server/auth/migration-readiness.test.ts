@@ -30,10 +30,11 @@ describe('promoted migrations match the reviewed Sprint 1.7 proposals', () => {
     { file: '20261103170000_create-auth-foundation.sql', proposal: '001_create_auth_foundation.sql', sha: 'fa614b04e8caf8faf4ee82ff211c5fb78c2853f16cba765775919452bd39fe2a' },
     { file: '20261103170100_restrict-auth-runtime-role.sql', proposal: '002_restricted_auth_runtime_role.sql', sha: '58be1ffd2ca6bc247ebbee88662aa3035d1a183492746004a4de413f7525f037' },
   ];
-  it('keeps the applied migrations first and in order, followed only by the forward-only platform migrations and the search_path fix', () => {
+  it('keeps the applied migrations first and in order, followed only by the forward-only platform migrations, the search_path fix and M7 (Sprint 2.0B)', () => {
     const dir = fileURLToPath(new URL('../../netlify/database/migrations/', import.meta.url));
     expect(readdirSync(dir).sort()).toEqual([...PROMOTED.map(m => m.file), '20261104120000_super-admin-role.sql', '20261104130000_platform-privileges-correction.sql',
-      '20261104150000_platform-administration-read-access.sql', '20261104160000_pin-function-search-path-pg-temp.sql']);
+      '20261104150000_platform-administration-read-access.sql', '20261104160000_pin-function-search-path-pg-temp.sql',
+      '20261104170000_organizations-expand.sql']);
   });
   it('keeps 20261104120000 byte-identical to the version applied on the preview branch', () => {
     expect(sha256(bytes('../../netlify/database/migrations/20261104120000_super-admin-role.sql'))).toBe('8476f1a8ba50cacd083d53d67bdda01b4903494bf3cb982f93cb39e38bef132f');
