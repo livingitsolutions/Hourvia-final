@@ -1,5 +1,5 @@
 <!-- Supabase → Authentication → Email Templates → "Reset password". Subject: Your Hourvia password reset code -->
 <h2>Reset your Hourvia password</h2>
 <p>Your 6-digit code is: <strong style="font-size:20px;letter-spacing:4px">{{ .Token }}</strong></p>
-<p>Or <a href="{{ .SiteURL }}/reset-password#token_hash={{ .TokenHash }}">choose a new password with this link</a>.</p>
+<p>Or <a href="{{ if .RedirectTo }}{{ .RedirectTo }}{{ else }}{{ .SiteURL }}/reset-password{{ end }}#token_hash={{ .TokenHash }}">choose a new password with this link</a>.</p>
 <p>The code and link expire soon and work once. If you didn't ask for this, ignore this email; your password is unchanged.</p>

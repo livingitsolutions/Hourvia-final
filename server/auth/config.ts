@@ -2,6 +2,10 @@ import type { AuthConfig } from './types';
 
 export type EnvReader = (name: string) => string | undefined;
 
+export const STAGING_SITE_ID = '48d7a24b-6072-40bc-866f-0d6e43a921ea';
+export const STAGING_ORIGIN = 'https://staging.hourvia.livingitsolutions.com';
+export interface DeploymentIdentity { siteId?: string; branch?: string }
+
 export interface ServerEnv { config: AuthConfig; supabase: { url: string; anonKey: string; serviceRoleKey: string } }
 
 const bounded = (raw: string | undefined, fallback: number, min: number, max: number): number => {
@@ -30,12 +34,23 @@ function parseSmokeTestEmails(raw: string | undefined): ReadonlySet<string> | nu
  * Production additionally requires HOURVIA_AUTH_ALLOW_PRODUCTION=true, an explicit HOURVIA_APP_ORIGIN and an
  * explicit launch stage: "smoke" (designated test accounts only) or "general".
  */
-export function readServerEnv(env: EnvReader, deployContext: string | undefined): ServerEnv | { unavailable: string } {
+export function readServerEnv(env: EnvReader, deployContext: string | undefined, identity?: DeploymentIdentity): ServerEnv | { unavailable: string } {
   const production = deployContext === 'production';
-  // Hourvia_Authentication is the production identity provider and there is no nonproduction project, so deploy
-  // previews, branch deploys and unknown contexts never get a working auth function, even if secrets leak into
-  // their scope. Only production (behind its gates) and local `netlify dev` can run.
-  if (!production && deployContext !== 'dev') return { unavailable: 'context_not_enabled' };
+  const staging = deployContext === 'branch-deploy' && identity?.siteId === STAGING_SITE_ID && identity.branch === 'staging';
+  if (!production && deployContext !== 'dev' && !staging) return { unavailable: 'context_not_enabled' };
+  if (staging) {
+    if (env('HOURVIA_AUTH_ALLOW_STAGING') !== 'true') return { unavailable: 'staging_not_enabled' };
+    // Operator attestation after branch-specific M1–M7/catalog verification. Bind it to the actual injected URL;
+    // a copied flag alone cannot authorize another database endpoint. Never override the platform database URL.
+    try {
+      const target = new URL(env('NETLIFY_DB_URL') ?? '');
+      if (!['postgres:', 'postgresql:'].includes(target.protocol) || !target.hostname.endsWith('.db.netlify.com')
+        || env('HOURVIA_STAGING_DATABASE_VERIFIED_TARGET') !== `staging:M7:${target.hostname}`)
+        return { unavailable: 'staging_database_not_verified' };
+    } catch { return { unavailable: 'staging_database_not_verified' }; }
+    if (env('HOURVIA_APP_ORIGIN') !== STAGING_ORIGIN || env('HOURVIA_AUTH_LAUNCH_STAGE') !== 'smoke')
+      return { unavailable: 'staging_misconfigured' };
+  }
   if (production && env('HOURVIA_AUTH_ALLOW_PRODUCTION') !== 'true') return { unavailable: 'production_not_enabled' };
   const url = env('SUPABASE_URL');
   const anonKey = env('SUPABASE_PUBLISHABLE_KEY') || env('SUPABASE_ANON_KEY');
@@ -52,6 +67,8 @@ export function readServerEnv(env: EnvReader, deployContext: string | undefined)
   let smokeTestEmails: ReadonlySet<string> | null = null;
   if (stage === 'smoke') {
     smokeTestEmails = parseSmokeTestEmails(env('HOURVIA_AUTH_SMOKE_TEST_EMAILS'));
+    if (staging && smokeTestEmails && ![...smokeTestEmails].every(email => /^hourvia-staging[+._-][a-z0-9+._-]+@/.test(email)))
+      return { unavailable: 'staging_test_accounts_required' };
     if (!smokeTestEmails) return { unavailable: 'misconfigured' };
   } else if (stage !== 'general' && (production || stage !== undefined)) {
     return { unavailable: 'launch_stage_not_set' };

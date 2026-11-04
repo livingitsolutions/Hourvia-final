@@ -1,10 +1,11 @@
 import { getDatabase } from '@netlify/database';
-import { readServerEnv, type EnvReader } from './config';
+import { readServerEnv, type EnvReader, type DeploymentIdentity } from './config';
 import type { DepsFactory } from './http';
 import { SupabaseIdentityProvider } from './provider-supabase';
 import { roleScopedSqlClient, statementGuardedSqlClient } from './sql-role';
 import { logDatabaseError } from './runtime-log';
 import { PostgresAuthStore } from './store-postgres';
+import { stagingDatabaseReady } from './staging-database';
 import type { SqlClient } from './types';
 
 interface PgLikeResult { rows: unknown[]; command?: string }
@@ -88,10 +89,12 @@ function platformPool(): PgLikePool {
 const store = () => (sharedStore ??= new PostgresAuthStore(statementGuardedSqlClient(roleScopedSqlClient(poolSqlClient(platformPool())))));
 
 /** Production wiring for Netlify Functions. All secrets come from protected environment variables. */
-export function runtimeDeps(env: EnvReader, deployContext: string | undefined): DepsFactory {
+export function runtimeDeps(env: EnvReader, deployContext: string | undefined, identity?: DeploymentIdentity): DepsFactory {
   return async () => {
-    const serverEnv = readServerEnv(env, deployContext);
+    const serverEnv = readServerEnv(env, deployContext, identity);
     if ('unavailable' in serverEnv) return serverEnv;
+    if (deployContext === 'branch-deploy' && !await stagingDatabaseReady(platformPool()))
+      return { unavailable: 'staging_database_not_ready' };
     const { supabase, config } = serverEnv;
     return {
       config,

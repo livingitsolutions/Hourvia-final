@@ -1,5 +1,5 @@
 <!-- Supabase → Authentication → Email Templates → "Invite user". Subject: You're invited to the ThriveSource workspace on Hourvia -->
 <h2>You're invited to Hourvia</h2>
 <p>A ThriveSource workspace admin invited you to Hourvia by Living IT Solutions.</p>
-<p><a href="{{ .SiteURL }}/accept-invite#token_hash={{ .TokenHash }}">Create your password</a></p>
+<p><a href="{{ if .RedirectTo }}{{ .RedirectTo }}{{ else }}{{ .SiteURL }}/accept-invite{{ end }}#token_hash={{ .TokenHash }}">Create your password</a></p>
 <p>The link works once and expires soon. If you weren't expecting this, you can ignore this email.</p>

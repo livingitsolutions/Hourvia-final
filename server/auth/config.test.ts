@@ -10,7 +10,7 @@ describe('server environment', () => {
     expect(readServerEnv(env({ ...full, HOURVIA_AUTH_HASH_KEY: 'short' }), 'dev')).toEqual({ unavailable: 'misconfigured' });
     expect(readServerEnv(env({ ...full, SUPABASE_ANON_KEY: 'same', SUPABASE_SERVICE_ROLE_KEY: 'same' }), 'dev')).toEqual({ unavailable: 'misconfigured' });
   });
-  it('never runs in deploy previews, branch deploys or unknown contexts, even fully configured', () => {
+  it('never runs in deploy previews, unidentified branch deploys or unknown contexts, even fully configured', () => {
     const everything = { ...full, HOURVIA_AUTH_ALLOW_PRODUCTION: 'true', HOURVIA_AUTH_LAUNCH_STAGE: 'general' };
     for (const context of ['deploy-preview', 'branch-deploy', 'staging', '', undefined]) expect(readServerEnv(env(everything), context)).toEqual({ unavailable: 'context_not_enabled' });
   });
