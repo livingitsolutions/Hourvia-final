@@ -44,6 +44,9 @@ describe('promoted migrations match the reviewed Sprint 1.7 proposals', () => {
   it('keeps 20261104150000 byte-identical to the version applied on the preview branch (Sprint 1.8B pin)', () => {
     expect(sha256(bytes('../../netlify/database/migrations/20261104150000_platform-administration-read-access.sql'))).toBe('b1f199ea303d7e1c437c5a56d6060a9f33bd746392c7e8a6bca8c659c255aea0');
   });
+  it('keeps 20261104160000 byte-identical to the reviewed Sprint 1.8B version applied on the preview branch (Sprint 1.8C pin)', () => {
+    expect(sha256(bytes('../../netlify/database/migrations/20261104160000_pin-function-search-path-pg-temp.sql'))).toBe('a1ff5af790a69ff9b83c6a8ff49f4718707cb8db8be71a79a1e94df0c6544d44');
+  });
   it('is byte-for-byte identical to the proposals and keeps the approved SHA-256', () => {
     for (const m of PROMOTED) {
       const promoted = bytes(`../../netlify/database/migrations/${m.file}`);
