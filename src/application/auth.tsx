@@ -1,11 +1,11 @@
 import { createContext, useContext, useEffect, useState, type ReactNode } from 'react';
 import type { AccountAccess, Authentication, LoginInput } from '../domain/contracts';
 import type { Principal } from '../domain/permissions';
-import type { WorkspaceAdminApi } from '../infrastructure/server-session-auth';
-interface AuthState { user: Principal | null; loading: boolean; failed: boolean; access: AccountAccess | null; admin: WorkspaceAdminApi | null; signIn(input: LoginInput): Promise<void>; signOut(): Promise<void> }
+import type { PlatformApi, WorkspaceAdminApi } from '../infrastructure/server-session-auth';
+interface AuthState { user: Principal | null; loading: boolean; failed: boolean; access: AccountAccess | null; admin: WorkspaceAdminApi | null; platform: PlatformApi | null; signIn(input: LoginInput): Promise<void>; signOut(): Promise<void> }
 const AuthContext = createContext<AuthState | null>(null);
 const RECHECK_MS = 5 * 60 * 1000;
-export function AuthProvider({ service, access = null, admin = null, children }: { service: Authentication; access?: AccountAccess | null; admin?: WorkspaceAdminApi | null; children: ReactNode }) {
+export function AuthProvider({ service, access = null, admin = null, platform = null, children }: { service: Authentication; access?: AccountAccess | null; admin?: WorkspaceAdminApi | null; platform?: PlatformApi | null; children: ReactNode }) {
   const [user, setUser] = useState<Principal | null>(null);
   const [loading, setLoading] = useState(true);
   const [failed, setFailed] = useState(false);
@@ -19,7 +19,7 @@ export function AuthProvider({ service, access = null, admin = null, children }:
     document.addEventListener('visibilitychange', recheck);
     return () => { active = false; window.clearInterval(timer); document.removeEventListener('visibilitychange', recheck); };
   }, [service, user?.id]); // eslint-disable-line react-hooks/exhaustive-deps
-  return <AuthContext.Provider value={{ user, loading, failed, access, admin, async signIn(input) { setFailed(false); setUser(await service.signIn(input)); }, async signOut() { setUser(null); await service.signOut(); } }}>{children}</AuthContext.Provider>;
+  return <AuthContext.Provider value={{ user, loading, failed, access, admin, platform, async signIn(input) { setFailed(false); setUser(await service.signIn(input)); }, async signOut() { setUser(null); await service.signOut(); } }}>{children}</AuthContext.Provider>;
 }
 export function useAuth() { const auth = useContext(AuthContext); if (!auth) throw new Error('AuthProvider is required'); return auth; }
 export function safeDestination(value: string | null): string {

@@ -86,7 +86,8 @@ Changing the designated UID, for example if the Supabase identity is permanently
 
 ## 5. Runtime database role: limits that remain
 
-- **Session user.** The function connects as `netlifydb_owner` and runs every statement under `SET LOCAL ROLE hourvia_auth_runtime`. Any code able to run arbitrary SQL could `RESET ROLE` and act as owner, bypassing the runtime-only rules. Everything else here is defence in depth. A hard boundary needs a dedicated LOGIN role with its own credential, and it isn't confirmed that Netlify Database supports that. **Unresolved.**
+- **Session user.** The function connects as `netlifydb_owner` and runs every statement under `SET LOCAL ROLE hourvia_auth_runtime`. Any code able to run arbitrary SQL could `RESET ROLE` and act as owner, bypassing the runtime-only rules. Everything else here is defence in depth. A hard boundary needs a dedicated LOGIN role with its own credential, and it isn't confirmed that Netlify Database supports that. **Unresolved** — see the Sprint 1.8 investigation in section 7.
+- **Temporary-table shadowing (fixed in Sprint 1.8B, section 8).** `PUBLIC`, and so the runtime, holds `TEMPORARY` on the database. Before `20261104160000`, every `hourvia_*` function resolved table names from `pg_temp` first, so runtime SQL could shadow guarded tables with temp tables.
 - **What still holds for the owner:**
   - identity immutability
   - append-only audit tables
@@ -103,3 +104,56 @@ Changing the designated UID, for example if the Supabase identity is permanently
 - While `HOURVIA_EMAIL_DELIVERY_AUTHORIZED=false`, every application invitation returns 503. Role changes don't need email.
 - In smoke mode, only allowlisted emails can be invited or administered.
 - The new isolation and seat-race guarantees for SaaS are design only. See [saas-pwa-architecture.md](saas-pwa-architecture.md).
+
+## 7. Platform Administration console (Sprint 1.8, `20261104150000`)
+
+A read-only console for the active Platform Super Admin. Grant, revoke and reinstatement stay operator-only (section 4).
+
+**Authorization planes.** Platform permissions (`platform.console`, `platform.overview.read`, `platform.audit.read`, in `src/domain/platform.ts`) come only from active platform privileges, never from the organization role. Workspace permissions are unchanged, and the platform privilege still adds only `administrators.manage` inside an organization where the holder is an Administrator. Consequence: a holder who is a Manager (reachable only through direct owner SQL) can open the console but administers nobody.
+
+**Enforcement, three layers.**
+1. **UI.** The Platform sidebar group and `/platform`, `/platform/audit` routes are shown only for `platform.console`. Other users get the restricted page and no API call is made.
+2. **API.** `GET /api/platform/overview` and `GET /api/platform/audit?limit=1..100&before=<id>` require a valid session (401 otherwise) and the platform permission (403 `platform_forbidden` otherwise, audited as `platform_access` / `denied` in `auth_audit_events`). Query parameters are validated after authorization. Responses are `no-store`. Cross-site, same-site, navigation and foreign-Origin requests are refused. There are no platform write, grant, revoke, impersonation or organization-listing routes.
+3. **Database.** The runtime calls `hourvia_platform_overview(token_hash)` and `hourvia_platform_audit_page(token_hash, before, limit)`. They are `SECURITY DEFINER` with a pinned `search_path`, and EXECUTE is granted to `hourvia_auth_runtime` only. Each function re-authorizes from the **session**: unrevoked, unexpired by the database clock, active ThriveSource membership, designated and verified identity, active grant. Otherwise it returns NULL and the API returns 403. No table privilege was added: the runtime still cannot read `platform_audit_events`, the designation or grant approval references directly, and cannot write any platform table.
+
+**What the console shows.** The holder's own active grant (date, approval reference), the designation date, grant history counts, **aggregate** ThriveSource membership counts (no identities, no other tenant), and the platform audit trail newest first. Other identities appear only as a 4-character UID suffix, and detail keys are allowlisted. Every audit page read is itself recorded as `platform_audit_read`.
+
+**Fail-closed behaviour.**
+- Revoking the grant denies the next request; the workspace session continues unless `END_SESSIONS=true`.
+- Disabling the holder's membership ends access (401), even though the grant row stays active.
+- Session expiry and logout end access.
+
+**Owner connection / dedicated LOGIN role — investigation.**
+- `@netlify/database` `getDatabase()` accepts a `connectionString` override, and `netlifydb_owner` has `CREATEROLE`. Mechanically, a `LOGIN` role with a password could therefore be created and used.
+- It is **not confirmed as supported** by Netlify Database. Nothing documents that the platform connection proxy authenticates custom roles. A password would have to be set out of band (it must never appear in a migration) and stored as a secret. Each database branch would need the role and credential provisioned separately.
+- No change was made. Until a preview-branch experiment confirms support, the boundary stays `SET LOCAL ROLE` under the owner session (defence in depth, not a hard boundary).
+- The new platform functions do not widen this risk: code able to `RESET ROLE` already had owner access to these tables.
+
+**Deployment notes.** `20261104150000` creates functions only and changes no table, grant or row. Its self-check aborts the deploy if the function security properties or the platform table privileges are not as expected. It is applied on the preview branch and pinned by SHA-256 (`b1f199ea…aea0`); it must never be edited. Its `search_path` is corrected forward-only by `20261104160000` (section 8). Netlify applies it on deploy. Verify on a preview branch before production.
+
+## 8. Security hardening (Sprint 1.8B, `20261104160000`)
+
+**H-1: `pg_temp` pinned last.**
+- **The problem.** When `pg_temp` is not listed in a function's `search_path`, PostgreSQL searches the temporary schema **first** for tables. The Sprint 1.8A audit showed that runtime-role SQL could use temp tables named like the guarded tables to:
+  - read the platform audit through `hourvia_platform_audit_page` without a holder session;
+  - let an ordinary Administrator promote a Contractor to Administrator past `hourvia_guard_member_update`.
+  A third variant was also found: a Contractor disguised as an Administrator in a temp `workspace_members` table.
+- **The fix.** `20261104160000` runs `ALTER FUNCTION … SET search_path = pg_catalog, public, pg_temp` on all 15 `hourvia_*` functions, listed explicitly. Functions and operators are never resolved from `pg_temp`, and tables now resolve to `public` first.
+- **Unchanged:** function signatures, bodies, volatility, `SECURITY DEFINER` flags, ownership and EXECUTE grants. No privilege is granted or revoked, and no row changes.
+- **Self-check.** The migration aborts if:
+  - the set of `hourvia_*` functions differs from the reviewed list;
+  - any function's config isn't exactly `search_path=pg_catalog, public, pg_temp`;
+  - `SECURITY DEFINER` is set anywhere other than the two platform read functions;
+  - a function isn't owned by the migration role, or its EXECUTE grants changed;
+  - the runtime can `CREATE` in `public` or create schemas.
+- **New functions.** Any future `hourvia_*` function must declare `SET search_path = pg_catalog, public, pg_temp` itself. Otherwise this migration's list no longer matches, and a later self-check should be added.
+- **Not done: revoking TEMP.** Revoking `TEMPORARY` from `PUBLIC` would also close the vector, but it removes TEMP from `netlifydb_readonly` and possibly from platform tooling. It is left for a separately tested change.
+
+**M-1: platform request limits** (`PLATFORM_LIMITS` in `server/auth/service.ts`). These are fixed one-hour windows, keyed by HMAC.
+- **Denials:** 10 per member and 30 per IP. The limit is checked **before** the denial is audited. Past it, the caller gets 429, and only the first rejection in each window writes a `rate_limited` row.
+- **Audit-page reads:** 60 per member. The limit is checked after authorization and parameter validation, and **before** the database call that writes `platform_audit_read`.
+- **Unaffected:** unauthenticated requests (401) are neither limited nor audited, and the holder's overview and workspace administration are not limited.
+- **Authorization is unchanged.** A 429 never carries platform data, and a rate-limited holder still passes every other check.
+
+**Tests** (`server/auth/platform-security.test.ts`). Each attack runs in a fresh PGlite database, as `hourvia_auth_runtime`, inside a transaction that is always rolled back. It is shown succeeding without `20261104160000` and failing with it. Other tests cover catalog preservation, the self-check's abort paths, applying over a live holder without changing data, and every rate-limit path.
+

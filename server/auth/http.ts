@@ -36,6 +36,12 @@ function sameOriginJson(req: Request): boolean {
   const type = (req.headers.get('content-type') ?? '').split(';')[0]!.trim().toLowerCase();
   return origin === new URL(req.url).origin && (site === null || site === 'same-origin') && type === 'application/json';
 }
+/** GET guard for platform reads: refuse cross-site/same-site fetches, navigations and foreign Origin headers. */
+function sameOriginRead(req: Request): boolean {
+  const origin = req.headers.get('origin');
+  const site = req.headers.get('sec-fetch-site');
+  return (origin === null || origin === new URL(req.url).origin) && (site === null || site === 'same-origin');
+}
 async function readJson(req: Request): Promise<{ value: unknown } | null> {
   const text = await req.text();
   if (new TextEncoder().encode(text).length > MAX_BODY_BYTES) return null;
@@ -44,7 +50,7 @@ async function readJson(req: Request): Promise<{ value: unknown } | null> {
 
 export type DepsFactory = () => Promise<AuthDeps | { unavailable: string }>;
 
-const routes: { method: 'GET' | 'POST'; pattern: RegExp; run(s: AuthService, meta: RequestMeta, body: unknown, match: RegExpMatchArray): Promise<Outcome> }[] = [
+const routes: { method: 'GET' | 'POST'; pattern: RegExp; run(s: AuthService, meta: RequestMeta, body: unknown, match: RegExpMatchArray, url: URL): Promise<Outcome> }[] = [
   { method: 'GET', pattern: /^\/api\/auth\/session$/, run: (s, m) => s.session(m) },
   { method: 'POST', pattern: /^\/api\/auth\/login$/, run: (s, m, b) => s.login(b, m) },
   { method: 'POST', pattern: /^\/api\/auth\/logout$/, run: (s, m) => s.logout(m) },
@@ -56,14 +62,22 @@ const routes: { method: 'GET' | 'POST'; pattern: RegExp; run(s: AuthService, met
   { method: 'POST', pattern: /^\/api\/admin\/members\/([^/]+)\/disable$/, run: (s, m, _b, x) => s.disableMember(x[1]!, m) },
   { method: 'POST', pattern: /^\/api\/admin\/members\/([^/]+)\/revoke-sessions$/, run: (s, m, _b, x) => s.revokeMemberSessions(x[1]!, m) },
   { method: 'POST', pattern: /^\/api\/admin\/members\/([^/]+)\/role$/, run: (s, m, b, x) => s.changeMemberRole(x[1]!, b, m) },
+  // Sprint 1.8 Platform Administration: read-only. There are deliberately no platform write, grant, revoke or
+  // impersonation routes; platform privileges change only through the operator procedures.
+  { method: 'GET', pattern: /^\/api\/platform\/overview$/, run: (s, m) => s.platformOverview(m) },
+  { method: 'GET', pattern: /^\/api\/platform\/audit$/, run: (s, m, _b, _x, u) => s.platformAudit(m, u.searchParams) },
 ];
+const PLATFORM_PATH = /^\/api\/platform\//;
 
 export async function handleAuthRequest(req: Request, ip: string | undefined, makeDeps: DepsFactory): Promise<Response> {
-  const path = new URL(req.url).pathname;
+  const url = new URL(req.url);
+  const path = url.pathname;
   const candidates = routes.map(route => ({ route, match: path.match(route.pattern) })).filter(c => c.match);
   if (!candidates.length) return error(404, 'not_found', 'Not found.');
   const found = candidates.find(c => c.route.method === req.method);
   if (!found) return error(405, 'method_not_allowed', 'Method not allowed.');
+  // Platform reads are for the console's same-origin fetches only (defence in depth on top of SameSite=Strict).
+  if (PLATFORM_PATH.test(path) && !sameOriginRead(req)) return error(403, 'origin_rejected', 'Request rejected.');
   let body: unknown;
   if (found.route.method === 'POST') {
     if (!sameOriginJson(req)) return error(403, 'origin_rejected', 'Request rejected.');
@@ -78,7 +92,7 @@ export async function handleAuthRequest(req: Request, ip: string | undefined, ma
     // serve the same deploy, such as *.netlify.app, are refused.
     if (deps.config.appOrigin && new URL(req.url).origin !== deps.config.appOrigin) return error(421, 'wrong_origin', 'Open Hourvia at its main address to sign in.');
     const meta: RequestMeta = { ip: ip || 'unknown', sessionToken: readSessionCookie(req.headers.get('cookie')) };
-    return respond(await found.route.run(new AuthService(deps), meta, body, found.match!));
+    return respond(await found.route.run(new AuthService(deps), meta, body, found.match!, url));
   } catch {
     // Missing tables, database or provider outages: fail closed without leaking internals.
     return error(503, 'auth_unavailable', 'Workspace sign-in is temporarily unavailable. Contact your workspace administrator.');
