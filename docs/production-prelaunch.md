@@ -1,6 +1,6 @@
 # Sprint 2.0B.2 production pre-launch safeguards
 
-This is the current production-only application policy. Main is the only development/deployment branch; staging is retired. Earlier preflight, activation, preview-verification and migration-promotion instructions are historical and must not authorize operations. This implementation changed code and ran offline tests only. It did not verify current production state, deploy, activate authentication, change configuration, run platform migrations, or contact the live provider.
+This is the current production-only application policy. Main is the only development/deployment branch; staging is retired as a workflow. Some platform settings do not yet enforce this policy (all branches and Deploy Previews still build, and a wildcard DNS record still resolves the old staging hostname). Their status and the owner actions are tracked in [operations status](operations-status.md). Earlier preflight, activation, preview-verification and migration-promotion instructions are historical and must not authorize operations. This implementation changed code and ran offline tests only. It did not verify current production state, deploy, activate authentication, change configuration, run platform migrations, or contact the live provider.
 
 ## Runtime admission
 

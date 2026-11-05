@@ -9,8 +9,10 @@ npm run typecheck
 npm test
 ```
 
-`npm run build` runs strict TypeScript validation and produces the Vite production bundle. Netlify's automatic build performs that step; no production deployment is requested for Sprint 0.
+`npm run build` stamps non-secret deployment metadata and then runs strict TypeScript validation and the Vite production bundle. Netlify's automatic build performs that step. `main` is the production branch: merging to `main` builds, auto-publishes to https://hourvia.livingitsolutions.com and applies any new file in `netlify/database/migrations/` to the production database. Treat every merge to `main` as a production release.
 
-Start at `/login`. Authentication uses Supabase Auth behind Netlify Functions with server-managed HttpOnly sessions; see [authentication](docs/authentication.md). The production provider is the Supabase project Hourvia_Authentication. Until the gates in [production-activation-plan](docs/production-activation-plan.md) are approved (configuration, staged auth schema, smoke-test stage), sign-in fails closed with a 503. There is no preview bypass, signup, or role selector.
+Start at `/login`. Authentication uses Supabase Auth behind Netlify Functions with server-managed HttpOnly sessions. The current controls are in [production pre-launch safeguards](docs/production-prelaunch.md); older activation documents are historical. Until those gates pass (independent production database evidence, synthetic identity policy, smoke-stage configuration), every `/api/auth/*`, `/api/admin/*` and `/api/platform/*` request fails closed with a 503. There is no preview bypass, signup, or role selector.
 
-See [architecture and permission contracts](docs/architecture.md) and [future time-tracking requirements](docs/time-tracking-contract.md). No database, timers, shifts, payments, payroll, monitoring, or SaaS subscriptions were implemented.
+The current verified state of the deployment, database and configuration, including what is owner-confirmed and what remains unverified, is in [operations status](docs/operations-status.md).
+
+See [architecture and permission contracts](docs/architecture.md) and [future time-tracking requirements](docs/time-tracking-contract.md). The auth, platform-administration and organization schema (migrations M1–M7) exists in Netlify Database. Timers, shifts, payments, payroll, monitoring and SaaS subscriptions are not implemented.
