@@ -19,7 +19,7 @@ Last reconciled: Sprint 2.0C.2, 2026-11-05. This document records what is known 
 | Site | `hourvia-tracker` (`48d7a24b-6072-40bc-866f-0d6e43a921ea`) |
 | Canonical URL | https://hourvia.livingitsolutions.com (200) |
 | Production branch | `main` (auto-publish, not locked) |
-| Published deploy | `6aeb6e63925ce1e8ac88d9f7`, commit `ae65a124406b81e98d7e6801a1f0456b7a46118d`, context `production`, database branch `production`, published 2026-11-04 17:42:29 UTC |
+| Published deploy | `6aebe50abd9ac16c02942a31`, commit `6c22106d4e97eff0860c77b9f14b468e25209f67`, context `production`, database branch `production`, published 2026-11-05 02:08:34 UTC (re-verified 2026-11-05, Sprint 3.0 preflight) |
 | Known-good rollback deploy | `6aeb5cd4c8797713f23cc5b8` (same commit) |
 | Authentication | Fail-closed. `/api/auth/session`, `/api/admin/members` and `/api/platform/overview` return 503 `auth_unavailable` |
 | Deploy secret scan | 94 files scanned, 0 matches |
@@ -50,7 +50,7 @@ These digests are pinned in `server/auth/production-database.ts` (`MIGRATION_DIG
 
 | Item | Owner-confirmed | Netlify metadata (verified) | Status |
 |---|---|---|---|
-| Nine variables (`HOURVIA_APP_ORIGIN`, `HOURVIA_AUTH_ALLOW_PRODUCTION`, `HOURVIA_AUTH_HASH_KEY`, `HOURVIA_AUTH_LAUNCH_STAGE`, `HOURVIA_AUTH_SMOKE_TEST_EMAILS`, `HOURVIA_EMAIL_DELIVERY_AUTHORIZED`, `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY`, `SUPABASE_URL`) | Production-only, Functions-scoped | Functions-scoped; each has one value in context **`all`** | Configuration discrepancy, to be checked in the dashboard |
+| Nine variables (`HOURVIA_APP_ORIGIN`, `HOURVIA_AUTH_ALLOW_PRODUCTION`, `HOURVIA_AUTH_HASH_KEY`, `HOURVIA_AUTH_LAUNCH_STAGE`, `HOURVIA_AUTH_SMOKE_TEST_EMAILS`, `HOURVIA_EMAIL_DELIVERY_AUTHORIZED`, `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY`, `SUPABASE_URL`) | Production-only, Functions-scoped | Recreated 2026-11-05 02:06–02:07 UTC. Each has exactly one value in context `production`. Deploy Preview, branch deploy and dev resolve none of them. A newly built Deploy Preview (`6aebe84ee08c78e7856b04a8`) reported all nine absent at runtime. | Resolved for new deploys. Deploys built before 2026-11-05 02:06 UTC kept the earlier values. |
 | `SUPABASE_SECRET_KEY` rotated, previous key revoked | Yes | Last updated 2026-11-04 17:14 UTC | Owner-confirmed |
 | `HOURVIA_SYNTHETIC_IDENTITY_POLICY`, `HOURVIA_PRODUCTION_DATABASE_EVIDENCE` | n/a | Not set | Correct for the current fail-closed state; both are required before any smoke activation |
 | Branch deploys | n/a | All branches build | Not yet aligned with the main-only policy |
@@ -60,7 +60,7 @@ These digests are pinned in `server/auth/production-database.ts` (`MIGRATION_DIG
 | Old deploy permalinks | n/a | Public; no password or SSO protection | Exposure remains until restricted or expired (90-day retention) |
 | Legacy staging hostname | n/a | Not attached to any site; resolves only through `*.hourvia.livingitsolutions.com` and returns a Netlify 404 | Not serving content; DNS cleanup pending |
 
-Even if a preview or branch deploy receives these variables, the code refuses authentication outside a published production deploy on this site whose stamped identity matches. Exposure of the values to code in a non-production build is still a risk, so the context discrepancy must be resolved.
+The code refuses authentication outside a published production deploy on this site whose stamped identity matches. Previews and branch deploys built after the 2026-11-05 rescoping receive none of the nine variables. Older preview and branch deploys still hold the values they were built with, so the previous Supabase secret key must stay revoked. The temporary diagnostic deploy `6aebe84ee08c78e7856b04a8` should be deleted by the owner.
 
 ## Release rules
 

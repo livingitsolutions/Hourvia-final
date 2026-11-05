@@ -1,5 +1,5 @@
-import { THRIVESOURCE_SYSTEM_CONTEXT, parseOrganizationId, type Organization, type OrganizationContext, type OrganizationId } from '../../src/domain/organization';
-import { WORKSPACE_ID, type PlatformPrivilege, type Role } from '../../src/domain/permissions';
+import { THRIVESOURCE_ORGANIZATION_ID, THRIVESOURCE_SYSTEM_CONTEXT, parseOrganizationId, type Organization, type OrganizationContext, type OrganizationId } from '../../src/domain/organization';
+import type { PlatformPrivilege, Role } from '../../src/domain/permissions';
 import { isPlatformPrivilege, type PlatformAuditDetail, type PlatformAuditEvent, type PlatformAuditPage, type PlatformOverview } from '../../src/domain/platform';
 import { organizationScopedSqlClient } from './tenant-sql';
 import type { AuditEvent, AuthStore, MemberRecord, SessionRecord, SqlClient } from './types';
@@ -39,16 +39,26 @@ function auditDetails(value: unknown): Record<string, PlatformAuditDetail> {
 }
 
 /**
- * Every query is parameterized and pinned by the server, never by input, to the ThriveSource workspace AND to the
- * store's organization context (Sprint 2.0B). All statements pass through organizationScopedSqlClient, which refuses any
+ * Every query is parameterized and pinned by the server, never by input, to the store's organization context and its
+ * legacy workspace key (Sprint 2.0B; Sprint 3.0 derives the workspace key from the context instead of a constant). All statements pass through organizationScopedSqlClient, which refuses any
  * tenant-table statement without an organization predicate bound to that context, before the statement policy runs.
  */
 export class PostgresAuthStore implements AuthStore {
   private readonly sql: SqlClient;
   private readonly org: OrganizationId;
+  /** The context's legacy workspace key (its immutable slug). 'thrivesource' in the ThriveSource context. */
+  private readonly ws: string;
+  /**
+   * Sprint 3.0: outside ThriveSource, INSERTs name organization_id explicitly (bound to the context by tenant-sql).
+   * That needs the M8 INSERT grant; without M8 such an INSERT is refused by the database (fail closed). ThriveSource
+   * keeps the M7 default-derived INSERTs, so the current production schema and grants are unaffected.
+   */
+  private readonly explicitOrganization: boolean;
   constructor(sql: SqlClient, readonly context: OrganizationContext = THRIVESOURCE_SYSTEM_CONTEXT) {
     this.sql = organizationScopedSqlClient(sql, context);
+    this.explicitOrganization = context.organizationId !== THRIVESOURCE_ORGANIZATION_ID;
     this.org = context.organizationId;
+    this.ws = context.legacyWorkspaceId;
   }
 
   async organization(): Promise<Organization | null> {
@@ -59,7 +69,7 @@ export class PostgresAuthStore implements AuthStore {
   }
 
   private async member(where: string, value: unknown): Promise<MemberRecord | null> {
-    const { rows } = await this.sql.query<MemberRow>(`SELECT ${MEMBER_COLUMNS} FROM workspace_members m WHERE m.workspace_id = $1 AND m.organization_id = $3 AND ${where} LIMIT 1`, [WORKSPACE_ID, value, this.org]);
+    const { rows } = await this.sql.query<MemberRow>(`SELECT ${MEMBER_COLUMNS} FROM workspace_members m WHERE m.workspace_id = $1 AND m.organization_id = $3 AND ${where} LIMIT 1`, [this.ws, value, this.org]);
     return rows[0] ? toMember(rows[0]) : null;
   }
   findMemberById(id: string) { return this.member('m.id = $2', id); }
@@ -67,7 +77,7 @@ export class PostgresAuthStore implements AuthStore {
   findMemberByAuthUserId(authUserId: string) { return this.member('m.auth_user_id = $2', authUserId); }
 
   async listMembers() {
-    const { rows } = await this.sql.query<MemberRow>(`SELECT ${MEMBER_COLUMNS} FROM workspace_members m WHERE m.workspace_id = $1 AND m.organization_id = $2 ORDER BY m.created_at, m.email`, [WORKSPACE_ID, this.org]);
+    const { rows } = await this.sql.query<MemberRow>(`SELECT ${MEMBER_COLUMNS} FROM workspace_members m WHERE m.workspace_id = $1 AND m.organization_id = $2 ORDER BY m.created_at, m.email`, [this.ws, this.org]);
     return rows.map(toMember);
   }
 
@@ -76,7 +86,7 @@ export class PostgresAuthStore implements AuthStore {
       `SELECT c.id FROM manager_assignments a JOIN workspace_members c ON c.id = a.contractor_member_id
        WHERE a.workspace_id = $1 AND c.workspace_id = $1 AND a.organization_id = $3 AND c.organization_id = $3
          AND a.manager_member_id = $2 AND c.role = 'contractor' AND c.status = 'active' ORDER BY c.id`,
-      [WORKSPACE_ID, managerMemberId, this.org]);
+      [this.ws, managerMemberId, this.org]);
     return rows.map(row => row.id);
   }
 
@@ -120,29 +130,29 @@ export class PostgresAuthStore implements AuthStore {
   upsertInvitation(input: { email: string; role: Role; displayName: string; authUserId: string; invitedBy: string | null; now: Date; expiresAt: Date }) {
     return this.sql.transaction(async tx => {
       const { rows } = await tx.query<MemberRow>(
-        `INSERT INTO workspace_members AS m (workspace_id, auth_user_id, email, display_name, role, status, created_at)
-         VALUES ($1, $2, $3, $4, $5, 'invited', $6)
+        `INSERT INTO workspace_members AS m (workspace_id, auth_user_id, email, display_name, role, status, created_at${this.explicitOrganization ? ', organization_id' : ''})
+         VALUES ($1, $2, $3, $4, $5, 'invited', $6${this.explicitOrganization ? ', $8' : ''})
          ON CONFLICT (workspace_id, email) DO UPDATE SET role = EXCLUDED.role, display_name = EXCLUDED.display_name,
            role_changed_by = CASE WHEN m.role IS DISTINCT FROM EXCLUDED.role THEN $7::uuid ELSE m.role_changed_by END,
            role_changed_at = CASE WHEN m.role IS DISTINCT FROM EXCLUDED.role THEN $6 ELSE m.role_changed_at END
            WHERE m.status = 'invited' AND m.auth_user_id = EXCLUDED.auth_user_id
          RETURNING ${MEMBER_COLUMNS}`,
-        [WORKSPACE_ID, input.authUserId, input.email.toLowerCase(), input.displayName, input.role, input.now, input.invitedBy]);
+        [this.ws, input.authUserId, input.email.toLowerCase(), input.displayName, input.role, input.now, input.invitedBy, ...(this.explicitOrganization ? [this.org] : [])]);
       const row = rows[0];
       if (!row) throw new Error('member_not_invitable');
       // The member row (new or existing) must belong to this store's organization before anything is attached to it.
       if (row.organization_id !== this.org) throw new Error('member_organization_mismatch');
-      await tx.query(`UPDATE workspace_invitations SET status = 'revoked' WHERE workspace_id = $1 AND organization_id = $3 AND member_id = $2 AND status = 'pending'`, [WORKSPACE_ID, row.id, this.org]);
+      await tx.query(`UPDATE workspace_invitations SET status = 'revoked' WHERE workspace_id = $1 AND organization_id = $3 AND member_id = $2 AND status = 'pending'`, [this.ws, row.id, this.org]);
       await tx.query(
-        `INSERT INTO workspace_invitations (workspace_id, member_id, email, role, status, invited_by_member_id, created_at, expires_at)
-         VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7)`,
-        [WORKSPACE_ID, row.id, row.email, input.role, input.invitedBy, input.now, input.expiresAt]);
+        `INSERT INTO workspace_invitations (workspace_id, member_id, email, role, status, invited_by_member_id, created_at, expires_at${this.explicitOrganization ? ', organization_id' : ''})
+         VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7${this.explicitOrganization ? ', $8' : ''})`,
+        [this.ws, row.id, row.email, input.role, input.invitedBy, input.now, input.expiresAt, ...(this.explicitOrganization ? [this.org] : [])]);
       return toMember(row);
     });
   }
 
   async hasPendingInvitation(memberId: string, now: Date) {
-    const { rows } = await this.sql.query(`SELECT 1 FROM workspace_invitations WHERE workspace_id = $1 AND organization_id = $4 AND member_id = $2 AND status = 'pending' AND expires_at > $3`, [WORKSPACE_ID, memberId, now, this.org]);
+    const { rows } = await this.sql.query(`SELECT 1 FROM workspace_invitations WHERE workspace_id = $1 AND organization_id = $4 AND member_id = $2 AND status = 'pending' AND expires_at > $3`, [this.ws, memberId, now, this.org]);
     return rows.length > 0;
   }
 
@@ -152,15 +162,15 @@ export class PostgresAuthStore implements AuthStore {
       // workspace_members row first, then its invitations. Without it, accept (invitation → member) and disable
       // (member → invitation) on the same member could deadlock. FOR NO KEY UPDATE is the lock the activation UPDATE
       // below takes anyway, so foreign-key inserts that reference the member (sessions, audit) are not blocked.
-      const locked = await tx.query(`SELECT id FROM workspace_members WHERE workspace_id = $1 AND organization_id = $3 AND id = $2 FOR NO KEY UPDATE`, [WORKSPACE_ID, memberId, this.org]);
+      const locked = await tx.query(`SELECT id FROM workspace_members WHERE workspace_id = $1 AND organization_id = $3 AND id = $2 FOR NO KEY UPDATE`, [this.ws, memberId, this.org]);
       if (locked.rows.length !== 1) return false;
       const accepted = await tx.query(
         `UPDATE workspace_invitations SET status = 'accepted', accepted_at = $3
-         WHERE workspace_id = $1 AND organization_id = $4 AND member_id = $2 AND status = 'pending' AND expires_at > $3 RETURNING id`, [WORKSPACE_ID, memberId, now, this.org]);
+         WHERE workspace_id = $1 AND organization_id = $4 AND member_id = $2 AND status = 'pending' AND expires_at > $3 RETURNING id`, [this.ws, memberId, now, this.org]);
       if (accepted.rows.length !== 1) return false;
       const activated = await tx.query(
         `UPDATE workspace_members SET status = 'active', activated_at = $3
-         WHERE workspace_id = $1 AND organization_id = $4 AND id = $2 AND status = 'invited' AND auth_user_id IS NOT NULL RETURNING id`, [WORKSPACE_ID, memberId, now, this.org]);
+         WHERE workspace_id = $1 AND organization_id = $4 AND id = $2 AND status = 'invited' AND auth_user_id IS NOT NULL RETURNING id`, [this.ws, memberId, now, this.org]);
       if (activated.rows.length !== 1) throw new Error('member_not_activatable');
       return true;
     });
@@ -171,8 +181,8 @@ export class PostgresAuthStore implements AuthStore {
     return this.sql.transaction(async tx => {
       const { rows } = await tx.query(
         `UPDATE workspace_members SET status = 'disabled', disabled_at = $3, disabled_by = $4
-         WHERE workspace_id = $1 AND organization_id = $5 AND id = $2 AND status <> 'disabled' AND id <> $4 RETURNING id`, [WORKSPACE_ID, memberId, now, disabledBy, this.org]);
-      if (rows.length) await tx.query(`UPDATE workspace_invitations SET status = 'revoked' WHERE workspace_id = $1 AND organization_id = $3 AND member_id = $2 AND status = 'pending'`, [WORKSPACE_ID, memberId, this.org]);
+         WHERE workspace_id = $1 AND organization_id = $5 AND id = $2 AND status <> 'disabled' AND id <> $4 RETURNING id`, [this.ws, memberId, now, disabledBy, this.org]);
+      if (rows.length) await tx.query(`UPDATE workspace_invitations SET status = 'revoked' WHERE workspace_id = $1 AND organization_id = $3 AND member_id = $2 AND status = 'pending'`, [this.ws, memberId, this.org]);
       return rows.length === 1;
     });
   }
@@ -182,14 +192,14 @@ export class PostgresAuthStore implements AuthStore {
     const { rows } = await this.sql.query(
       `UPDATE workspace_members SET role = $3, role_changed_by = $5, role_changed_at = $6
        WHERE workspace_id = $1 AND organization_id = $7 AND id = $2 AND role = $4 AND status = 'active' AND id <> $5 RETURNING id`,
-      [WORKSPACE_ID, input.memberId, input.role, input.expectedRole, input.changedBy, input.now, this.org]);
+      [this.ws, input.memberId, input.role, input.expectedRole, input.changedBy, input.now, this.org]);
     return rows.length === 1;
   }
 
   async createSession(input: { tokenHash: string; memberId: string; now: Date; idleExpiresAt: Date; absoluteExpiresAt: Date }) {
     await this.sql.query(
-      `INSERT INTO auth_sessions (token_hash, member_id, created_at, last_seen_at, idle_expires_at, absolute_expires_at) VALUES ($1, $2, $3, $3, $4, $5)`,
-      [input.tokenHash, input.memberId, input.now, input.idleExpiresAt, input.absoluteExpiresAt]);
+      `INSERT INTO auth_sessions (token_hash, member_id, created_at, last_seen_at, idle_expires_at, absolute_expires_at${this.explicitOrganization ? ', organization_id' : ''}) VALUES ($1, $2, $3, $3, $4, $5${this.explicitOrganization ? ', $6' : ''})`,
+      [input.tokenHash, input.memberId, input.now, input.idleExpiresAt, input.absoluteExpiresAt, ...(this.explicitOrganization ? [this.org] : [])]);
   }
 
   async resolveSession(tokenHash: string, now: Date): Promise<SessionRecord | null> {
@@ -199,7 +209,7 @@ export class PostgresAuthStore implements AuthStore {
          JOIN organizations o ON o.id = m.organization_id
        WHERE s.token_hash = $1 AND s.revoked_at IS NULL AND s.idle_expires_at > $2 AND s.absolute_expires_at > $2
          AND m.workspace_id = $3 AND m.status = 'active'
-         AND s.organization_id = $4 AND m.organization_id = $4 AND o.id = $4 AND o.status = 'active' LIMIT 1`, [tokenHash, now, WORKSPACE_ID, this.org]);
+         AND s.organization_id = $4 AND m.organization_id = $4 AND o.id = $4 AND o.status = 'active' LIMIT 1`, [tokenHash, now, this.ws, this.org]);
     const row = rows[0];
     return row ? { sessionId: row.session_id, member: toMember(row), lastSeenAt: new Date(row.last_seen_at), absoluteExpiresAt: new Date(row.absolute_expires_at) } : null;
   }
@@ -227,8 +237,9 @@ export class PostgresAuthStore implements AuthStore {
 
   async audit(event: AuditEvent, now: Date) {
     await this.sql.query(
-      `INSERT INTO auth_audit_events (workspace_id, occurred_at, event_type, outcome, actor_member_id, subject_member_id, email_hmac, ip_hmac, details)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)`,
-      [WORKSPACE_ID, now, event.eventType, event.outcome, event.actorMemberId ?? null, event.subjectMemberId ?? null, event.emailHmac ?? null, event.ipHmac ?? null, JSON.stringify(event.details ?? {})]);
+      `INSERT INTO auth_audit_events (workspace_id, occurred_at, event_type, outcome, actor_member_id, subject_member_id, email_hmac, ip_hmac, details${this.explicitOrganization ? ', organization_id' : ''})
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb${this.explicitOrganization ? ', $10' : ''})`,
+      [this.ws, now, event.eventType, event.outcome, event.actorMemberId ?? null, event.subjectMemberId ?? null, event.emailHmac ?? null, event.ipHmac ?? null, JSON.stringify(event.details ?? {}), ...(this.explicitOrganization ? [this.org] : [])]);
   }
 }
+

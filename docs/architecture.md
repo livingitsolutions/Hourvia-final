@@ -100,3 +100,19 @@ The same UUID appears in three places: the migration (seed row and column defaul
 **Sprint 2.0C prerequisites found by M7 tests**
 - `hourvia_audit_member_change` and `hourvia_audit_session_revocation` still write the default organization. A member of another organization would fail closed on the composite audit foreign key, so 2.0C must make them write `NEW.organization_id`.
 - 2.0C must also grant the runtime explicit, checked `organization_id` INSERTs before dropping the defaults.
+
+## Organization-first multi-tenancy (Sprint 3.0, M8 proposal — not applied)
+
+Hourvia is organization-first. Every workspace belongs to an organization, and there are no personal workspaces. A solo consultant gets a single-member organization. Sprint 3.0 adds the backend contracts and the forward-only M8 proposal. **Production behaviour is unchanged:** the HTTP API, `AuthService` and runtime wiring stay ThriveSource-only, and every multi-organization path returns 503 `multi_organization_unavailable` until M8 is promoted.
+
+- **M8 proposal:** `db/proposals/sprint-3.0/20261106120000_multi-organization-memberships.sql`. Its README covers dependencies, backfill, constraints, RLS and authorization implications, rollback limits and the promotion strategy. It is outside `netlify/database/migrations/`, so no environment applies it, and M1–M7 are byte-identical.
+- **Global identity, per-organization memberships:** `UNIQUE (organization_id, auth_user_id)` replaces the global uniqueness. Each membership has its own role and its own status (`invited`, `active`, `suspended` (operator-only), or `disabled`, the removed state).
+- **Server-authoritative context:** the context is derived from the session cookie: `auth_sessions` → membership → organization. `organizationContextForVerifiedMembership` (`src/domain/organization.ts`) builds it only from server-read rows, only for an active organization, and only with a `MultiOrganizationCapability`. Production never holds a capability in Sprint 3.0, and only offline tests mint one (a source scan enforces this).
+- **Switching contract:** `OrganizationAccessService` (`server/auth/organization-service.ts`) lists, selects, revalidates, reports seats and authorizes. Selection matches the requested id against the identity's own memberships. Non-member, suspended, removed, malformed and inactive targets all give the same 403. A successful switch revokes the old session and issues a new one bound to the target membership. No HTTP route is registered.
+- **Identity directory:** `server/auth/organization-directory.ts` holds the only cross-organization reads. There are two fixed, allowlisted statements, and the identity is taken from the session row, never from input.
+- **Tenant isolation:**
+  - `tenant-sql.ts` now also covers `organization_seat_entitlements` and the reserved future tables `projects`, `time_entries`, `timesheets`, `clients`, `invoices` and `billing_rates`.
+  - Explicit `organization_id` INSERTs are accepted only outside ThriveSource, as one VALUES row with a bare parameter equal to the context. The ThriveSource context keeps the Sprint 2.0B rule.
+  - `src/domain/tenancy.ts` provides `assertTenantResource`, `scopeTenantResources` and `organizationCan`. The last applies the unchanged role rules after a strict same-organization check.
+- **Seats:** `organization_seat_entitlements` (M8). Active members consume seats, pending unexpired invitations reserve them, and suspended or disabled members don't count. Organizations are counted independently. M8 guards enforce the limit in the database. ThriveSource is `internal_unlimited`, and only the internal kind (ThriveSource) can hold that plan.
+- **Platform Super Admin:** unchanged and still single. M8 restricts the platform candidate to the designated mailbox's ThriveSource membership. Organization roles never yield a platform privilege, and the platform console still needs the holder's ThriveSource session.

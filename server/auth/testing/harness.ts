@@ -21,6 +21,8 @@ export const PLATFORM_ADMIN_SQL = migration('20261104150000_platform-administrat
 export const SEARCH_PATH_SQL = migration('20261104160000_pin-function-search-path-pg-temp.sql');
 // Sprint 2.0B: M7 organization foundation (expand only). Applied by default, so every existing test runs against it.
 export const ORGANIZATIONS_SQL = migration('20261104170000_organizations-expand.sql');
+// Sprint 3.0: the M8 PROPOSAL (db/proposals/sprint-3.0/). Never in netlify/database/migrations; applied only when a test opts in.
+export const M8_PROPOSAL_SQL = readFileSync(fileURLToPath(new URL('../../../db/proposals/sprint-3.0/20261106120000_multi-organization-memberships.sql', import.meta.url)), 'utf8');
 const operation = (name: string) => readFileSync(fileURLToPath(new URL(`../../../db/operations/platform/${name}`, import.meta.url)), 'utf8');
 export const GRANT_PLATFORM_SQL = operation('grant-platform-super-admin.sql');
 export const REVOKE_PLATFORM_SQL = operation('revoke-platform-super-admin.sql');
@@ -107,7 +109,7 @@ export class FakeSupabase implements IdentityProvider {
   tokenFor(email: string, map: Map<string, string>) { return [...map].find(([, e]) => e === email)?.[0]; }
 }
 
-export async function createHarness(options: { schema?: boolean; restrictedRole?: boolean; correction?: boolean; platformAdmin?: boolean; searchPathFix?: boolean; organizations?: boolean; config?: Partial<AuthConfig>; now?: Date } = {}) {
+export async function createHarness(options: { schema?: boolean; restrictedRole?: boolean; correction?: boolean; platformAdmin?: boolean; searchPathFix?: boolean; organizations?: boolean; multiOrganization?: boolean; config?: Partial<AuthConfig>; now?: Date } = {}) {
   const pg = new PGlite();
   await asNetlifyOwner(pg);
   if (options.schema !== false) await applyMigration(pg, SCHEMA_SQL);
@@ -120,6 +122,7 @@ export async function createHarness(options: { schema?: boolean; restrictedRole?
       if (options.searchPathFix !== false) {
         await applyMigration(pg, SEARCH_PATH_SQL);
         if (options.organizations !== false) await applyMigration(pg, ORGANIZATIONS_SQL);
+        if (options.organizations !== false && options.multiOrganization === true) await applyMigration(pg, M8_PROPOSAL_SQL);
       }
     }
   }
