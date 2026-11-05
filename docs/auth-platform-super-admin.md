@@ -1,8 +1,8 @@
 # Hourvia Platform Super Admin privilege
 
-**Status: implemented in development and preview only. Not applied to production, and not granted to anyone.**
+**Status: schema deployed; privilege not usable while authentication is fail-closed.** Netlify deploy metadata records migrations `20261104120000` and `20261104130000` as applied to the production database by deploy `6aea8aec9a00df94dd253407` (2026-11-04 01:31 UTC). Whether anyone holds the privilege in production is **unverified**: production database reads are unavailable from Agent Runner (401). No grant has been authorized by any sprint. See [operations status](operations-status.md).
 
-This privilege replaces the withdrawn workspace role `super_admin`, which came from migration `20261104120000`. That migration is applied on the Agent Runner preview database branch and stays unchanged. Migration `20261104130000_platform-privileges-correction` corrects it, forward-only.
+This privilege replaces the withdrawn workspace role `super_admin`, which came from migration `20261104120000`. That migration stays unchanged. Migration `20261104130000_platform-privileges-correction` corrects it, forward-only.
 
 ## 1. Model: two independent planes
 

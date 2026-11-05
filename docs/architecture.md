@@ -48,17 +48,17 @@ All workspace screens are explicit future-sprint placeholders with role guards. 
 
 ## Future deployment and storage
 
-Vite emits static assets to `dist`. Netlify uses the checked-in build command and SPA fallback. Future server endpoints belong in `netlify/functions`. Sprint 1.7 adds the auth function. Its tables are staged as an unapplied proposal in `db/proposals/sprint-1.7-auth`, and no migrations exist in `netlify/database/migrations`. Use Netlify Database managed PostgreSQL with @netlify/database and Drizzle in Sprint 1; define the eventual schema in `db/schema.ts` only after the domain model and identity mapping are approved. Do not introduce browser persistence or an external database for application records.
+Vite emits static assets to `dist`. Netlify uses the checked-in build command and SPA fallback. Future server endpoints belong in `netlify/functions`. Sprint 1.7 added the auth function. Its schema was promoted from `db/proposals/sprint-1.7-auth` into `netlify/database/migrations`, which now holds the seven immutable migrations M1–M7 (see [operations status](operations-status.md) for digests and production evidence). Use Netlify Database managed PostgreSQL with @netlify/database and Drizzle in Sprint 1; define the eventual schema in `db/schema.ts` only after the domain model and identity mapping are approved. Do not introduce browser persistence or an external database for application records.
 
 ## Security and release limits
 
-Identity and role security are not operational until tested against a real provider and backend. No production deployment or DNS change was performed. The login form validates locally and returns an unavailable message without sending credentials. Password recovery likewise reports that it is not connected. No signup, preview login, seeded accounts, or permissive fallback exists.
+Identity and role security are not operational until tested against a real provider and backend. Production is deployed at https://hourvia.livingitsolutions.com with authentication fail-closed (503 `auth_unavailable`); see [production pre-launch safeguards](production-prelaunch.md). The login form validates locally and returns an unavailable message without sending credentials. Password recovery likewise reports that it is not connected. No signup, preview login, seeded accounts, or permissive fallback exists.
 
 Google Fonts supplies DM Sans and Manrope; the UI falls back to sans-serif offline. Self-host fonts if external font requests are unsuitable for the internal workspace. Responsive breakpoints and reduced-motion support are implemented; real-browser visual and assistive-technology checks remain recommended before release.
 
 ## Organization foundation (Sprint 2.0B, migration M7)
 
-Migration `20261104170000_organizations-expand.sql` (M7) is the additive "expand" step of the Sprint 2.0A multi-tenant design. It runs on the `feature/hourvia-2.0-tenancy` integration track and must not reach `main` until the Sprint 1.9G promotion gates pass. Merging to `main` applies migrations to production.
+Migration `20261104170000_organizations-expand.sql` (M7) is the additive "expand" step of the Sprint 2.0A multi-tenant design. It was originally planned for a separate `feature/hourvia-2.0-tenancy` track. It reached `main` through PR #15 (2026-11-04 15:24 UTC) and is part of the reviewed M1–M7 baseline. Merging to `main` applies migrations to production. The production ledger recorded M7 before that merge, by a source that no deploy records; see [operations status](operations-status.md). Its catalog in production is not yet independently verified.
 
 **Stable organization identity.** These values are permanent. Never change or reuse them.
 
@@ -83,7 +83,7 @@ The same UUID appears in three places: the migration (seed row and column defaul
 - A new `organizations_single_tenant_m7` CHECK that allows only ThriveSource.
 - RLS stays disabled.
 - The runtime role (`hourvia_auth_runtime`) gains exactly one grant: `SELECT (id, slug, name, kind, status) ON organizations`. It has no INSERT or UPDATE on any `organization_id` column, so application rows always take the ThriveSource default. Every other grant, function EXECUTE privilege and SECURITY DEFINER function is unchanged.
-- The deployed application (799f042) never names `organization_id`, so it stays compatible with M7. Rolling the application back is safe while the defaults remain.
+- The pre-M7 application (`799f042`) never names `organization_id`, so it stays code-compatible with M7. Republishing a pre-M7 deploy is still prohibited: its deploy no longer carries M7, and the platform reports a migration-history error (observed on deploy `6aeabf28` at 15:20–15:23 UTC). Roll back only to a deploy built from a commit that contains M1–M7.
 
 **Application foundation** (ThriveSource-only behavior)
 - `src/domain/organization.ts`: the branded `OrganizationId` (canonical lower-case UUID only), the `Organization` model, and the frozen, branded `OrganizationContext`. A context is built server-side from a membership row or the single supported organization, and never from request input. Unsupported, malformed or mismatched organizations are rejected.
