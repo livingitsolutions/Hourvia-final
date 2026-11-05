@@ -63,13 +63,14 @@ declare const organizationContextBrand: unique symbol;
 export interface OrganizationContext {
   readonly [organizationContextBrand]: true;
   readonly organizationId: OrganizationId;
-  readonly legacyWorkspaceId: typeof THRIVESOURCE_LEGACY_WORKSPACE_ID;
+  /** The organization's immutable slug, still stored as workspace_id ('thrivesource' for ThriveSource). */
+  readonly legacyWorkspaceId: string;
   /** 'system': pre-authentication flows (login, recovery, invitation acceptance) in the single supported organization. */
   readonly source: 'membership' | 'system';
 }
 
 export class OrganizationContextError extends Error {
-  constructor(reason: 'invalid_organization' | 'unsupported_organization' | 'workspace_mismatch') {
+  constructor(reason: 'invalid_organization' | 'unsupported_organization' | 'workspace_mismatch' | 'multi_organization_unavailable' | 'organization_inactive') {
     super(`organization_context_rejected:${reason}`);
     this.name = 'OrganizationContextError';
   }
@@ -94,3 +95,51 @@ export const THRIVESOURCE_SYSTEM_CONTEXT: OrganizationContext = makeContext(THRI
 /** Whether a membership-derived value matches the context (a plain comparison that cannot be satisfied by a non-UUID). */
 export const belongsToOrganization = (context: OrganizationContext, organizationId: unknown) =>
   parseOrganizationId(organizationId) === context.organizationId;
+
+// ---------- Sprint 3.0: multi-organization contexts (available only with M8 and an explicit capability) ----------
+
+/** Mirrors the organizations.slug CHECK. */
+export const ORGANIZATION_SLUG = /^[a-z0-9](?:[a-z0-9-]{1,46}[a-z0-9])$/;
+
+declare const capabilityBrand: unique symbol;
+/**
+ * Proof that the multi-organization schema (M8) is present and verified. Without it no context for an organization
+ * other than ThriveSource can be built, so every multi-organization path fails closed. Production never holds one in
+ * Sprint 3.0: M8 is a proposal, and the production evidence gate pins exactly M1-M7.
+ */
+export interface MultiOrganizationCapability { readonly [capabilityBrand]: true; readonly schema: 'm8' }
+const minted = new WeakSet<object>();
+/** Sprint 3.0 production status of multi-organization features. */
+export const MULTI_ORGANIZATION_AVAILABILITY = { available: false, reason: 'm8_not_applied' } as const;
+/**
+ * Mints a capability for offline tests against a disposable database with the M8 proposal applied. Imported only by
+ * the offline multi-organization tests (a source-scan test enforces this). Promotion of M8 must replace it with an evidence-bound check.
+ */
+export function mintMultiOrganizationCapabilityForOfflineTests(): MultiOrganizationCapability {
+  const capability = Object.freeze({ schema: 'm8' }) as MultiOrganizationCapability;
+  minted.add(capability);
+  return capability;
+}
+export const isMultiOrganizationCapability = (value: unknown): value is MultiOrganizationCapability =>
+  typeof value === 'object' && value !== null && minted.has(value);
+
+/**
+ * Builds a membership context for ANY organization, from rows the server read itself: the membership and its
+ * organization must agree on id and slug, the organization must be active, and a capability must be presented.
+ * Client input is never an argument here; callers pass database rows only.
+ */
+export function organizationContextForVerifiedMembership(
+  member: { organizationId: unknown; workspaceId: unknown },
+  organization: { id: unknown; slug: unknown; status: unknown },
+  capability: unknown,
+): OrganizationContext {
+  if (!isMultiOrganizationCapability(capability)) throw new OrganizationContextError('multi_organization_unavailable');
+  const id = parseOrganizationId(member.organizationId);
+  if (!id || parseOrganizationId(organization.id) !== id) throw new OrganizationContextError('invalid_organization');
+  if (typeof organization.slug !== 'string' || !ORGANIZATION_SLUG.test(organization.slug) || member.workspaceId !== organization.slug
+    || (id === THRIVESOURCE_ORGANIZATION_ID) !== (organization.slug === THRIVESOURCE_ORGANIZATION_SLUG)) {
+    throw new OrganizationContextError('workspace_mismatch');
+  }
+  if (organization.status !== 'active') throw new OrganizationContextError('organization_inactive');
+  return Object.freeze({ organizationId: id, legacyWorkspaceId: organization.slug, source: 'membership' }) as OrganizationContext;
+}

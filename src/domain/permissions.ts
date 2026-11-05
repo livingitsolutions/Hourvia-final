@@ -32,17 +32,23 @@ const grants: Record<Role, readonly Permission[]> = {
   contractor: own,
 };
 export interface Authorization { can(principal: Principal | null, permission: Permission, resource: ResourceScope): boolean }
+/** The role-dependent part of a principal. Shared by the ThriveSource authorization below and the Sprint 3.0 organization authorization. */
+export type RoleSubject = Pick<Principal, 'id' | 'role' | 'assignedContractorIds' | 'approvalAuthorized' | 'platformPrivileges'>;
+/** Role rules only. Callers must first establish that the subject and the resource belong to the same organization. */
+export function roleCan(user: RoleSubject, permission: Permission, contractorId: string | undefined): boolean {
+  if (!Object.hasOwn(grants, user.role) || !grants[user.role].includes(permission)) return false;
+  // Managing Administrators needs BOTH an Administrator membership in this organization and the platform privilege.
+  if (permission === 'administrators.manage') return user.role === 'workspace_admin' && !!user.platformPrivileges?.includes('platform_super_admin');
+  if (user.role === 'workspace_admin') return true;
+  if (permission === 'dashboard') return true;
+  if (user.role === 'contractor') return contractorId === user.id;
+  if (permission === 'approvals.review' && !user.approvalAuthorized) return false;
+  return !!contractorId && user.assignedContractorIds.includes(contractorId);
+}
 export const authorization: Authorization = {
   can(user, permission, resource) {
     if (!user || user.workspaceId !== WORKSPACE_ID || resource.workspaceId !== WORKSPACE_ID) return false;
-    if (!Object.hasOwn(grants, user.role) || !grants[user.role].includes(permission)) return false;
-    // Managing Administrators needs BOTH an Administrator membership in this organization and the platform privilege.
-    if (permission === 'administrators.manage') return user.role === 'workspace_admin' && hasPlatformPrivilege(user, 'platform_super_admin');
-    if (user.role === 'workspace_admin') return true;
-    if (permission === 'dashboard') return true;
-    if (user.role === 'contractor') return resource.contractorId === user.id;
-    if (permission === 'approvals.review' && !user.approvalAuthorized) return false;
-    return !!resource.contractorId && user.assignedContractorIds.includes(resource.contractorId);
+    return roleCan(user, permission, resource.contractorId);
   },
 };
 // Navigation is discoverability only; every future backend request must authorize its resource.

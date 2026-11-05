@@ -24,15 +24,26 @@ import type { SqlClient } from './types';
  * CHECKs, single-tenant CHECK, no runtime write privilege on organization_id) remain the authoritative boundary.
  */
 export const TENANT_TABLES = ['workspace_members', 'workspace_invitations', 'manager_assignments', 'auth_sessions', 'auth_audit_events'] as const;
+/** Sprint 3.0: tenant tables created by the M8 proposal (absent until M8 is applied). */
+export const M8_TENANT_TABLES = ['organization_seat_entitlements'] as const;
+/**
+ * Reserved names for future organization-owned business tables (projects, time records, timesheets, billing). Any
+ * statement that names one is held to the same organization predicate rules today, so they are tenant-scoped from the
+ * first line of code that touches them.
+ */
+export const RESERVED_TENANT_TABLES = ['projects', 'time_entries', 'timesheets', 'clients', 'invoices', 'billing_rates'] as const;
 /** Tables keyed by organization but scoped by their own primary key. */
 export const ORGANIZATION_ROOT_TABLES = ['organizations'] as const;
 /** Tables that are global by design: HMAC rate-limit buckets and the platform plane (keyed by Supabase identity). */
 export const GLOBAL_TABLES = ['auth_rate_limits', 'platform_privileges', 'platform_super_admin_designation', 'platform_audit_events'] as const;
 
-type ScopedTable = typeof TENANT_TABLES[number] | typeof ORGANIZATION_ROOT_TABLES[number];
+type ScopedTable = typeof TENANT_TABLES[number] | typeof M8_TENANT_TABLES[number] | typeof RESERVED_TENANT_TABLES[number] | typeof ORGANIZATION_ROOT_TABLES[number];
 const SCOPE_COLUMN: Record<ScopedTable, string> = {
   workspace_members: 'organization_id', workspace_invitations: 'organization_id', manager_assignments: 'organization_id',
   auth_sessions: 'organization_id', auth_audit_events: 'organization_id', organizations: 'id',
+  organization_seat_entitlements: 'organization_id',
+  projects: 'organization_id', time_entries: 'organization_id', timesheets: 'organization_id', clients: 'organization_id',
+  invoices: 'organization_id', billing_rates: 'organization_id',
 };
 const SCOPED = Object.keys(SCOPE_COLUMN) as ScopedTable[];
 const NOT_AN_ALIAS = new Set(['where', 'set', 'on', 'join', 'left', 'right', 'inner', 'outer', 'cross', 'full', 'values', 'order', 'group',
@@ -43,8 +54,12 @@ export class TenantStatementRejectedError extends Error {
 }
 
 export interface TenantStatementAnalysis {
-  /** 'global': touches no tenant table. 'scoped': every tenant reference carries a predicate. 'default_insert': INSERT relying on the M7 default. */
-  kind: 'global' | 'scoped' | 'default_insert';
+  /**
+   * 'global': touches no tenant table. 'scoped': every tenant reference carries a predicate. 'default_insert': INSERT
+   * relying on the M7 default. 'organization_insert' (Sprint 3.0, needs M8 grants): INSERT naming organization_id as a
+   * bare positional parameter that must equal the context.
+   */
+  kind: 'global' | 'scoped' | 'default_insert' | 'organization_insert';
   tables: ScopedTable[];
   /** 1-based parameter positions that must carry the context's organization id. */
   organizationParams: number[];
@@ -52,8 +67,15 @@ export interface TenantStatementAnalysis {
 
 interface Reference { table: ScopedTable; qualifier: string; clause: string; index: number }
 
+/**
+ * Options. allowOrganizationInsert (Sprint 3.0, default false) permits INSERTs that name organization_id as a bare
+ * parameter. assertTenantStatement enables it only for contexts other than ThriveSource (they need the M8 grant); the
+ * ThriveSource context keeps the Sprint 2.0B rule that organization_id is never written.
+ */
+export interface TenantStatementOptions { allowOrganizationInsert?: boolean }
+
 /** Static (parameter-free) validation of one statement. Throws TenantStatementRejectedError on any violation. */
-export function analyzeTenantStatement(text: string): TenantStatementAnalysis {
+export function analyzeTenantStatement(text: string, options: TenantStatementOptions = {}): TenantStatementAnalysis {
   // The existing statement policy runs first and is never relaxed: one statement, no comments, no quoted identifiers,
   // SELECT/INSERT/UPDATE only, no set_config/pg_settings.
   assertAllowedStatement(text);
@@ -89,8 +111,23 @@ export function analyzeTenantStatement(text: string): TenantStatementAnalysis {
     if (!target || target.clause !== 'into' || refs.length !== 1) throw new TenantStatementRejectedError('insert_shape');
     const columns = lower.slice(target.index).match(/^into\s+[a-z_]+(?:\s+as\s+[a-z_]+)?\s*\(([^)]*)\)/);
     if (!columns) throw new TenantStatementRejectedError('insert_column_list');
-    if (/\borganization_id\b/.test(columns[1]!)) throw new TenantStatementRejectedError('organization_id_assignment');
-    return { kind: 'default_insert', tables: [target.table], organizationParams: [] };
+    const names = columns[1]!.split(',').map(c => c.trim());
+    const position = names.indexOf('organization_id');
+    if (position < 0 || !options.allowOrganizationInsert) {
+      if (/\borganization_id\b/.test(columns[1]!)) throw new TenantStatementRejectedError('organization_id_assignment');
+      return { kind: 'default_insert', tables: [target.table], organizationParams: [] };
+    }
+    // Explicit organization: exactly one VALUES row, and the organization_id item must be a bare $n (no expression,
+    // no subquery, no literal), so the run-time check below binds it to the context.
+    if (names.filter(n => n === 'organization_id').length !== 1 || /\bselect\b/.test(lower.slice(target.index + columns[0].length))) {
+      throw new TenantStatementRejectedError('organization_id_assignment');
+    }
+    // A single row only: nothing but whitespace, ON CONFLICT or RETURNING may follow the one VALUES tuple.
+    const values = lower.slice(target.index + columns[0].length).match(/^\s*values\s*\(([^()]*)\)\s*(?:$|on conflict\b|returning\b)/);
+    const items = values?.[1]!.split(',').map(v => v.trim());
+    const bound = items && items.length === names.length ? items[position]!.match(/^\$(\d+)$/) : null;
+    if (!bound) throw new TenantStatementRejectedError('organization_id_assignment');
+    return { kind: 'organization_insert', tables: [target.table], organizationParams: [Number(bound[1])] };
   }
 
   // Every SELECT/UPDATE reference needs its own predicate, after the first WHERE or ON (never in a SET list).
@@ -114,7 +151,9 @@ export function analyzeTenantStatement(text: string): TenantStatementAnalysis {
 
 /** Full check of one statement and its parameters against a context. */
 export function assertTenantStatement(text: string, params: readonly unknown[] | undefined, context: OrganizationContext): TenantStatementAnalysis {
-  const analysis = analyzeTenantStatement(text);
+  // Explicit organization INSERTs exist only outside ThriveSource (Sprint 3.0, M8 grants). In the ThriveSource context the
+  // Sprint 2.0B rule stands unchanged: organization_id is never written, and INSERTs take the M7 default.
+  const analysis = analyzeTenantStatement(text, { allowOrganizationInsert: context.organizationId !== THRIVESOURCE_ORGANIZATION_ID });
   for (const position of analysis.organizationParams) {
     if (!params || params[position - 1] !== context.organizationId) throw new TenantStatementRejectedError('organization_parameter');
   }

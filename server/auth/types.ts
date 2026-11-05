@@ -8,11 +8,12 @@ export interface SqlClient {
   transaction<T>(fn: (tx: SqlClient) => Promise<T>): Promise<T>;
 }
 
-export type MemberStatus = 'invited' | 'active' | 'disabled';
+/** 'suspended' exists only with M8 (operator-set); the application never sets or clears it. */
+export type MemberStatus = 'invited' | 'active' | 'suspended' | 'disabled';
 export interface MemberRecord {
   id: string;
   workspaceId: string;
-  /** M7 organization_id. Always ThriveSource in Sprint 2.0B; never taken from request input. */
+  /** organization_id. Always ThriveSource until M8; never taken from request input. */
   organizationId: OrganizationId;
   authUserId: string | null;
   email: string;
