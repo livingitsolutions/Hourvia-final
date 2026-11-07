@@ -3,7 +3,11 @@
 // which creates a brand-new local PostgreSQL 18 cluster (Unix socket only, no TCP listener) in a temp directory, runs
 // this file against it and then destroys the cluster. It never reads NETLIFY_DB_URL or any other existing database.
 //
-// The four applied migrations run unchanged. Only inside the disposable cluster, the designated mailbox is swapped for
+// Sprint 3.0.2: the applied migrations M1-M7 run unchanged (M7 was missing before, so every scenario that drives the
+// current application store, which reads organizations and organization_id, failed). With
+// HOURVIA_GRANT_REHEARSAL_VARIANT=m8 (scripts/rehearsal/platform-grant-rehearsal.sh m8) the M8 PROPOSAL is applied on
+// top, only inside the disposable cluster, and the same 16 scenarios run against it.
+// The applied migrations run unchanged. Only inside the disposable cluster, the designated mailbox is swapped for
 // a synthetic one in two places: the operator procedure text (in memory, never on disk) and the migration's
 // hourvia_is_verified_platform_candidate() body, rewritten from its own pg_get_functiondef with only that literal changed.
 import { createHash, randomUUID } from 'node:crypto';
@@ -15,13 +19,13 @@ import { handleAuthRequest } from './http';
 import { poolSqlClient, TransactionClosedError } from './runtime';
 import { roleScopedSqlClient, statementGuardedSqlClient } from './sql-role';
 import { PostgresAuthStore } from './store-postgres';
-import { FakeSupabase, GRANT_PLATFORM_SQL, ORIGIN, PLATFORM_ADMIN_SQL, PLATFORM_EMAIL, PLATFORM_ROLES_SQL, PLATFORM_SQL, ROLE_SQL, SCHEMA_SQL, SEARCH_PATH_SQL, SUPER_ADMIN_SQL, fillOperatorSql } from './testing/harness';
+import { FakeSupabase, GRANT_PLATFORM_SQL, M8_PROPOSAL_SQL, ORGANIZATIONS_SQL, ORIGIN, PLATFORM_ADMIN_SQL, PLATFORM_EMAIL, PLATFORM_ROLES_SQL, PLATFORM_SQL, ROLE_SQL, SCHEMA_SQL, SEARCH_PATH_SQL, SUPER_ADMIN_SQL, fillOperatorSql } from './testing/harness';
 import type { AuthConfig, AuthDeps, SqlClient } from './types';
 
 interface PgClient { connect(): Promise<void>; end(): Promise<void>; query<T = any>(text: string, params?: unknown[]): Promise<{ rows: T[]; rowCount: number | null }> }
 interface PgModule {
   Client: new (cfg: Record<string, unknown>) => PgClient;
-  Pool: new (cfg: Record<string, unknown>) => { query: PgClient['query']; connect(): Promise<PgClient & { release(): void }>; end(): Promise<void> };
+  Pool: new (cfg: Record<string, unknown>) => { query: PgClient['query']; connect(): Promise<PgClient & { release(): void }>; end(): Promise<void>; on(event: 'error', fn: (e: Error) => void): void };
 }
 const pg = createRequire(import.meta.url)('pg') as PgModule;
 
@@ -33,7 +37,8 @@ const SUPER = 'rehearsal_super';
 const enabled = env.HOURVIA_GRANT_REHEARSAL === 'disposable-local-cluster' && !!SOCKET && PORT > 0 && !!PGDATA;
 
 const SYNTHETIC_EMAIL = 'grant-rehearsal@hourvia.invalid';
-const TEMPLATE = 'hourvia_rehearsal_template';
+const VARIANT = env.HOURVIA_GRANT_REHEARSAL_VARIANT === 'm8' ? 'm8' : 'm7';
+const TEMPLATE = `hourvia_rehearsal_template_${VARIANT}`;
 const LOCK_TIMEOUT_MS = 5000;
 
 // ---- Test-only operator SQL: identical to the shipped procedure except the designated mailbox literal. ----------------
@@ -104,7 +109,7 @@ const expectConsistentGrant = (st: Awaited<ReturnType<Scenario['state']>>, uid: 
   expect(st.platformAudit[1].details).toMatchObject({ grant_id: st.privileges[0].id, approval_ref: approval, source: 'operator_sql' });
 };
 
-describe.skipIf(!enabled)('AP-PSA-GRANT rehearsal on a disposable PostgreSQL 18 cluster', () => {
+describe.skipIf(!enabled)(`AP-PSA-GRANT rehearsal on a disposable PostgreSQL 18 cluster (${VARIANT === 'm8' ? 'M1-M7 + M8 proposal' : 'M1-M7'})`, () => {
   beforeAll(async () => {
     // ---- Isolation evidence: refuse anything that is not the cluster this run just created. ----
     const socketDir = resolve(SOCKET);
@@ -132,9 +137,13 @@ describe.skipIf(!enabled)('AP-PSA-GRANT rehearsal on a disposable PostgreSQL 18 
     await t.connect();
     await t.query(PLATFORM_ROLES_SQL);
     await t.query('SET SESSION AUTHORIZATION netlifydb_owner');
-    // Sprint 1.9C.1: all six applied migrations, exactly as on the preview and production branches.
-    for (const [name, sql] of [['20261103170000', SCHEMA_SQL], ['20261103170100', ROLE_SQL], ['20261104120000', SUPER_ADMIN_SQL], ['20261104130000', PLATFORM_SQL],
-      ['20261104150000', PLATFORM_ADMIN_SQL], ['20261104160000', SEARCH_PATH_SQL]] as const) {
+    // Sprint 3.0.2: all seven applied migrations (M1-M7), exactly as on the preview and production branches, plus the
+    // M8 proposal in the m8 variant only. M8 runs before the mailbox substitution, so it sees the shipped function bodies.
+    log(`variant ${VARIANT}`);
+    const migrations: (readonly [string, string])[] = [['20261103170000', SCHEMA_SQL], ['20261103170100', ROLE_SQL], ['20261104120000', SUPER_ADMIN_SQL], ['20261104130000', PLATFORM_SQL],
+      ['20261104150000', PLATFORM_ADMIN_SQL], ['20261104160000', SEARCH_PATH_SQL], ['20261104170000', ORGANIZATIONS_SQL]];
+    if (VARIANT === 'm8') migrations.push(['M8 proposal 20261106120000', M8_PROPOSAL_SQL]);
+    for (const [name, sql] of migrations) {
       await t.query('BEGIN'); await t.query(sql); await t.query('COMMIT'); // one transaction per file, like the runner
       log(`applied migration ${name} sha256:${sha(sql)}`);
     }
@@ -311,6 +320,7 @@ describe.skipIf(!enabled)('AP-PSA-GRANT rehearsal on a disposable PostgreSQL 18 
       const lis = await s.seed('workspace_admin', 'active', SYNTHETIC_EMAIL, uid);
       const target = await s.seed('contractor', 'active', 'c@rehearsal.invalid');
       const pool = new pg.Pool({ host: SOCKET, port: PORT, user: 'netlifydb_owner', database: s.db, max: 2 });
+      pool.on('error', () => undefined); // idle clients are terminated by DROP DATABASE ... WITH (FORCE)
       try {
         const config: AuthConfig = { hashKey: 'k'.repeat(48), appOrigin: ORIGIN, emailDeliveryAuthorized: true, idleTimeoutSeconds: 1800, absoluteTimeoutSeconds: 43200, invitationTtlSeconds: 7 * 86400, recoveryMinimumMs: 0, smokeTestEmails: null };
         const deps: AuthDeps = { store: new PostgresAuthStore(statementGuardedSqlClient(roleScopedSqlClient(poolSqlClient(pool as any)))), provider, config, now: () => new Date(), sleep: async () => undefined };
@@ -356,6 +366,7 @@ describe.skipIf(!enabled)('AP-PSA-GRANT rehearsal on a disposable PostgreSQL 18 
   /** The production client chain over a real pg.Pool, optionally pausing (transaction still open) before one statement. */
   const appStore = (s: Scenario, app: string, pauseBefore?: RegExp) => {
     const pool = new pg.Pool({ host: SOCKET, port: PORT, user: 'netlifydb_owner', database: s.db, max: 1, application_name: app });
+    pool.on('error', () => undefined); // idle clients are terminated by DROP DATABASE ... WITH (FORCE)
     const base = statementGuardedSqlClient(roleScopedSqlClient(poolSqlClient(pool as any)));
     let open!: () => void; const gate = new Promise<void>(r => { open = r; });
     let arrived!: () => void; const atGate = new Promise<void>(r => { arrived = r; });

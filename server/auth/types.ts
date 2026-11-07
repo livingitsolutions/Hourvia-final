@@ -65,6 +65,8 @@ export interface AuthStore extends TenantScopedStore {
   hasPendingInvitation(memberId: string, now: Date): Promise<boolean>;
   acceptInvitation(memberId: string, now: Date): Promise<boolean>;
   disableMember(memberId: string, disabledBy: string, now: Date): Promise<boolean>;
+  /** Sprint 3.0.2 (G1): status change, session revocation and invitation revocation in one transaction. */
+  disableMemberAndRevokeSessions(memberId: string, disabledBy: string, now: Date): Promise<{ changed: boolean; sessionsRevoked: number }>;
   /** Changes an active member's role from expectedRole to role, recording the authorizing member. */
   changeMemberRole(input: { memberId: string; expectedRole: Role; role: Role; changedBy: string; now: Date }): Promise<boolean>;
   createSession(input: { tokenHash: string; memberId: string; now: Date; idleExpiresAt: Date; absoluteExpiresAt: Date }): Promise<void>;

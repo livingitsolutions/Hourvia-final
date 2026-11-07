@@ -388,8 +388,9 @@ export class AuthService {
     const denied = await this.manageable(admin, target, 'member_disabled');
     if (denied) return denied;
     if (this.outsideSmoke(target.email) || !await this.approvedMember(target)) return fail(403, 'smoke_allowlist', 'During production smoke testing, only designated test accounts can be changed.');
-    const changed = await this.deps.store.disableMember(memberId, admin.id, this.now);
-    const revoked = await this.deps.store.revokeMemberSessions(memberId, 'member_disabled', this.now, admin.id);
+    // Sprint 3.0.2 (G1): one transaction. A failure can no longer leave a disabled member with live sessions that an
+    // operator reinstatement would revive; either the member is disabled with every session ended, or nothing changed.
+    const { changed, sessionsRevoked: revoked } = await this.deps.store.disableMemberAndRevokeSessions(memberId, admin.id, this.now);
     let providerBanned = false;
     if (target.authUserId) { try { await this.deps.provider.banUser(target.authUserId); providerBanned = true; } catch { /* Hourvia disable is already authoritative */ } }
     await this.audit({ eventType: 'member_disabled', outcome: 'success', actorMemberId: admin.id, subjectMemberId: memberId, details: { changed, target_role: target.role, authority: this.authority(admin, target.role), sessions_revoked: revoked, provider_banned: providerBanned } });

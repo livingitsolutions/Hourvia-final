@@ -28,6 +28,10 @@
 --     are created only for active members of active organizations and at most 24 hours long; suspending a member or an
 --     organization revokes its sessions; seat, session and suspension paths require READ COMMITTED; runtime audit rows
 --     outside ThriveSource must name a member; runtime-created members need an authorized invitation by COMMIT.
+--   * Sprint 3.0.2: disabling a member revokes its sessions in the same statement (attributed to disabled_by), exactly
+--     like suspension; leaving 'disabled' or 'suspended' sweeps any session that is still unrevoked, so reinstatement
+--     never restores an old session. The 24-hour session cap is anchored to the database clock: created_at may not lie
+--     in the future, so a supplied timestamp cannot extend the lifetime.
 --
 -- What it deliberately does NOT do:
 --   * No organization is created, no row is moved or rewritten, and no audit row is touched. ADD COLUMN uses a
@@ -86,7 +90,7 @@ BEGIN
     RAISE EXCEPTION 'the M7 ThriveSource organization_id defaults are not in their reviewed state; stop and review';
   END IF;
   IF EXISTS (SELECT 1 FROM pg_trigger WHERE NOT tgisinternal AND tgname IN ('auth_sessions_guard_insert', 'auth_audit_events_guard_insert',
-               'workspace_members_suspension_revocation', 'organizations_suspension_revocation', 'workspace_members_runtime_invitation',
+               'workspace_members_status_session_revocation', 'organizations_suspension_revocation', 'workspace_members_runtime_invitation',
                'organization_seat_entitlements_guard', 'organization_seat_entitlements_no_truncate')) THEN
     RAISE EXCEPTION 'an M8 trigger already exists; M8 must be applied exactly once to an M7 database';
   END IF;
@@ -555,6 +559,16 @@ BEGIN
   IF NEW.absolute_expires_at > NEW.created_at + interval '24 hours' THEN
     RAISE EXCEPTION 'session absolute lifetime exceeds 24 hours';
   END IF;
+  -- Sprint 3.0.2 (G2): created_at is supplied by the caller, so the cap above alone could be stretched indefinitely
+  -- with a future created_at. Both are anchored to the database's real clock (clock_timestamp(), not the transaction
+  -- start), with two minutes of tolerance for application/database clock skew. A past created_at only shortens a
+  -- session. The absolute expiry is therefore never later than database time + 24 hours + 2 minutes.
+  IF NEW.created_at > clock_timestamp() + interval '2 minutes' THEN
+    RAISE EXCEPTION 'session created_at is in the future';
+  END IF;
+  IF NEW.absolute_expires_at > clock_timestamp() + interval '24 hours 2 minutes' THEN
+    RAISE EXCEPTION 'session absolute lifetime exceeds 24 hours of database time';
+  END IF;
   PERFORM pg_advisory_xact_lock_shared(hashtextextended('hourvia_sessions:' || NEW.organization_id::text, 0));
   IF NOT EXISTS (SELECT 1 FROM workspace_members m JOIN organizations o ON o.id = m.organization_id
                  WHERE m.id = NEW.member_id AND m.organization_id = NEW.organization_id AND m.status = 'active'
@@ -567,22 +581,45 @@ $$;
 CREATE TRIGGER auth_sessions_guard_insert BEFORE INSERT ON auth_sessions
   FOR EACH ROW EXECUTE FUNCTION hourvia_guard_session_insert();
 
--- Suspension is final for existing sessions: they are revoked (revocation is immutable), so reactivation can only ever
--- lead to a fresh sign-in. Revocations are audited by the existing session revocation trigger (authority 'operator').
+-- Suspension and disable are final for existing sessions: they are revoked (revocation is immutable), so reactivation
+-- or reinstatement can only ever lead to a fresh sign-in. Revocations are audited by the existing session revocation
+-- trigger.
+-- Sprint 3.0.2 (G1): 'disabled' is covered exactly like 'suspended'. Attribution:
+--   * into 'suspended': revoked_by NULL (operator-only transition; audit authority 'operator');
+--   * into 'disabled': revoked_by = NEW.disabled_by, the member the disable is attributed to. For the runtime, the
+--     member guard has already required that member's authority over the subject, and the session guard re-checks it
+--     (audit authority 'workspace_admin' or 'platform_super_admin'). Operator SQL with no disabled_by is 'operator';
+--   * leaving 'disabled' or 'suspended' (operator reinstatement or unsuspension; the runtime can do neither): any session
+--     still unrevoked, which only a pre-M8 non-atomic disable can have left behind, is revoked with reason
+--     'member_reinstated' and authority 'operator', before the member can act again.
+-- The exclusive per-organization session lock is the same one suspension takes, so a session committed concurrently
+-- with a disable is either refused by the insert guard (disable first) or revoked here (session first).
 CREATE FUNCTION hourvia_revoke_member_sessions() RETURNS trigger
 LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$
+DECLARE
+  reason text;
+  actor uuid;
 BEGIN
   IF current_setting('transaction_isolation') <> 'read committed' THEN
-    RAISE EXCEPTION 'suspension requires READ COMMITTED isolation';
+    RAISE EXCEPTION 'member suspension, disable and reinstatement require READ COMMITTED isolation';
+  END IF;
+  IF NEW.status = 'suspended' THEN
+    reason := 'member_suspended';
+  ELSIF NEW.status = 'disabled' THEN
+    reason := 'member_disabled';
+    actor := NEW.disabled_by;
+  ELSE
+    reason := 'member_reinstated';
   END IF;
   PERFORM pg_advisory_xact_lock(hashtextextended('hourvia_sessions:' || NEW.organization_id::text, 0));
-  UPDATE auth_sessions SET revoked_at = now(), revoked_reason = 'member_suspended'
+  UPDATE auth_sessions SET revoked_at = now(), revoked_reason = reason, revoked_by_member_id = actor
    WHERE member_id = NEW.id AND organization_id = NEW.organization_id AND revoked_at IS NULL;
   RETURN NULL;
 END
 $$;
-CREATE TRIGGER workspace_members_suspension_revocation AFTER UPDATE OF status ON workspace_members
-  FOR EACH ROW WHEN (NEW.status = 'suspended' AND OLD.status IS DISTINCT FROM 'suspended')
+CREATE TRIGGER workspace_members_status_session_revocation AFTER UPDATE OF status ON workspace_members
+  FOR EACH ROW WHEN (OLD.status IS DISTINCT FROM NEW.status
+                     AND (NEW.status IN ('suspended', 'disabled') OR OLD.status IN ('suspended', 'disabled')))
   EXECUTE FUNCTION hourvia_revoke_member_sessions();
 
 CREATE FUNCTION hourvia_revoke_organization_sessions() RETURNS trigger
@@ -729,8 +766,18 @@ BEGIN
         'platform_super_admin_designation_audit', 'platform_super_admin_designation_no_truncate',
         'organizations_guard', 'organizations_no_truncate', 'organization_seat_entitlements_guard',
         'organization_seat_entitlements_no_truncate', 'auth_sessions_guard_insert', 'auth_audit_events_guard_insert',
-        'workspace_members_suspension_revocation', 'organizations_suspension_revocation', 'workspace_members_runtime_invitation')) <> 25 THEN
+        'workspace_members_status_session_revocation', 'organizations_suspension_revocation', 'workspace_members_runtime_invitation')) <> 25 THEN
     RAISE EXCEPTION 'self-check failed: guard or audit triggers are missing or disabled';
+  END IF;
+  -- Sprint 3.0.2 (G1): the member revocation trigger fires on transitions into and out of both 'suspended' and 'disabled'.
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'workspace_members_status_session_revocation' AND tgrelid = 'public.workspace_members'::regclass
+                 AND pg_get_triggerdef(oid) LIKE '%''suspended''%' AND pg_get_triggerdef(oid) LIKE '%''disabled''%'
+                 AND pg_get_triggerdef(oid) LIKE '%old.status%') THEN
+    RAISE EXCEPTION 'self-check failed: member session revocation does not cover suspension and disable';
+  END IF;
+  -- Sprint 3.0.2 (G2): the session lifetime cap is anchored to the database clock.
+  IF pg_get_functiondef('public.hourvia_guard_session_insert()'::regprocedure) NOT LIKE '%NEW.created_at > clock_timestamp()%' THEN
+    RAISE EXCEPTION 'self-check failed: hourvia_guard_session_insert does not bound created_at by the database clock';
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'workspace_members_runtime_invitation' AND tgconstraint <> 0 AND tgdeferrable AND tginitdeferred
                  AND tgrelid = 'public.workspace_members'::regclass) THEN

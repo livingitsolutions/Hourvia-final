@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
 # DISPOSABLE PostgreSQL 18 rehearsal for AP-PSA-GRANT (test-only; never touches Netlify preview or production databases).
 #
-#   bash scripts/rehearsal/platform-grant-rehearsal.sh
+#   bash scripts/rehearsal/platform-grant-rehearsal.sh        # M1-M7 as shipped (default)
+#   bash scripts/rehearsal/platform-grant-rehearsal.sh m8     # M1-M7 + the M8 PROPOSAL (disposable cluster only)
 #
 # 1. Downloads pinned PostgreSQL 18.6 server binaries (npm package @embedded-postgres/linux-x64, install scripts
 #    disabled) into a new temp directory outside the repository.
 # 2. initdb's a brand-new cluster in another new temp directory and starts it with NO TCP listener (Unix socket only,
 #    trust auth for local socket connections). No existing database, URL or credential is read.
-# 3. Runs server/auth/platform-grant.rehearsal.test.ts against it.
+# 3. Runs server/auth/platform-grant.rehearsal.test.ts against it (M1-M7, plus the M8 proposal in the m8 variant; M8 is
+#    never applied anywhere else).
 # 4. Always stops the server and deletes the cluster and the binaries, then verifies they are gone.
 # Exit code: the test result; 3 if cleanup failed; 2 if PostgreSQL 18 could not be provisioned (BLOCKED).
 set -uo pipefail
+VARIANT="${1:-m7}"
+case "$VARIANT" in m7|m8) ;; *) echo "usage: $0 [m7|m8]"; exit 64 ;; esac
 PG_PKG='@embedded-postgres/linux-x64@18.6.0-beta.19'
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN_DIR="$(mktemp -d /tmp/hv-pgbin-XXXXXX)"
@@ -57,7 +61,7 @@ fi
 echo "[rehearsal] disposable cluster: data=$PGDATA socket=$SOCK port=$PORT (no TCP listener)"
 
 cd "$REPO"
-HOURVIA_GRANT_REHEARSAL=disposable-local-cluster HOURVIA_REHEARSAL_PGSOCKET="$SOCK" HOURVIA_REHEARSAL_PGPORT="$PORT" \
+HOURVIA_GRANT_REHEARSAL=disposable-local-cluster HOURVIA_GRANT_REHEARSAL_VARIANT="$VARIANT" HOURVIA_REHEARSAL_PGSOCKET="$SOCK" HOURVIA_REHEARSAL_PGPORT="$PORT" \
 HOURVIA_REHEARSAL_PGDATA="$PGDATA" NETLIFY_DB_URL= NETLIFY_AGENT_RUNNER_DB_CONNECTION_STRING= \
   npx vitest run --testTimeout=60000 server/auth/platform-grant.rehearsal.test.ts
 TEST_STATUS=$?

@@ -59,8 +59,8 @@ const liveSessions = (h: Harness, org: OrganizationId) => one<{ n: number }>(h, 
 const switchAudits = (h: Harness) => rows(h, `SELECT organization_id::text AS o, outcome, details->>'direction' AS d, details->>'reason' AS r FROM auth_audit_events WHERE event_type = 'organization_switch' ORDER BY id`);
 
 /** Dana: Manager in ThriveSource, Contractor in Acme (one identity). A ThriveSource Administrator who can revoke Dana. */
-async function setup(wrap?: (h: Harness) => (inner: Transaction) => Transaction) {
-  const h = await createHarness({ now: new Date(), multiOrganization: true });
+async function setup(wrap?: (h: Harness) => (inner: Transaction) => Transaction, start = new Date()) {
+  const h = await createHarness({ now: start, multiOrganization: true });
   await provision(h, ACME, 'acme');
   const tsAdmin = await h.seedMember('admin@thrivesource.test', 'workspace_admin');
   const danaTs = await h.seedMember('dana@example.test', 'workspace_manager');
@@ -140,8 +140,11 @@ describe('H2: one source session yields at most one replacement', () => {
 });
 
 describe('H3: switching never extends the absolute session lifetime', () => {
+  // Sprint 3.0.2 (G2): the session insert guard refuses a created_at ahead of the database clock, so these tests start
+  // the application clock in the past and advance it toward (never beyond) real time.
+  const past = () => new Date(Date.now() - 13 * HOUR);
   it('the replacement inherits the source absolute expiry, and the cookie never outlives it', async () => {
-    const { h, service, ts, danaTs } = await setup();
+    const { h, service, ts, danaTs } = await setup(undefined, past());
     const meta = await session(h, ts, danaTs.id, 'D');
     const original = await one<{ a: Date }>(h, `SELECT absolute_expires_at AS a FROM auth_sessions WHERE token_hash = $1`, [sha256Hex(meta.sessionToken)]);
     h.advance(20 * 60); // within the 30-minute idle timeout
@@ -153,7 +156,7 @@ describe('H3: switching never extends the absolute session lifetime', () => {
     expect(next.maxAge).toBe(12 * 3600 - 20 * 60);
   });
   it('repeated switching stops working at the original 12-hour limit', async () => {
-    const { h, service, ts, danaTs } = await setup();
+    const { h, service, ts, danaTs } = await setup(undefined, past());
     let meta = await session(h, ts, danaTs.id, 'E');
     let current: OrganizationId = TS, hops = 0, last = 200;
     for (let i = 0; i < 40; i++) {
