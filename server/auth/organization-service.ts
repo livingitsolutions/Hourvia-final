@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import {
-  isMultiOrganizationCapability, organizationContextForVerifiedMembership, type MultiOrganizationCapability, type OrganizationContext,
+  THRIVESOURCE_ORGANIZATION_ID, isMultiOrganizationCapability, organizationContextForVerifiedMembership, type MultiOrganizationCapability,
+  type OrganizationContext,
 } from '../../src/domain/organization';
 import type { Permission } from '../../src/domain/permissions';
 import {
@@ -10,6 +11,7 @@ import {
 import { isSessionTokenShape, newSessionToken, sha256Hex } from './crypto';
 import type { IdentityDirectory, ResolvedIdentity } from './organization-directory';
 import type { Outcome, RequestMeta } from './service';
+import type { PostgresAuthStore } from './store-postgres';
 import type { PostgresTenancyStore } from './store-tenancy';
 import type { AuthStore } from './types';
 
@@ -29,6 +31,11 @@ export interface OrganizationServiceDeps {
   directory: IdentityDirectory;
   /** Store bound to exactly one server-built context. */
   storeFor(context: OrganizationContext): AuthStore;
+  /**
+   * Sprint 3.0.1: runs fn in ONE database transaction; every store it builds shares that transaction. Used by the
+   * organization switch so that revoking the source session and issuing its replacement commit together or not at all.
+   */
+  transaction<T>(fn: (storeFor: (context: OrganizationContext) => PostgresAuthStore) => Promise<T>): Promise<T>;
   tenancyFor(context: OrganizationContext): PostgresTenancyStore;
   now(): Date;
   session: { idleTimeoutSeconds: number; absoluteTimeoutSeconds: number };
@@ -41,6 +48,7 @@ export const organizationMessages = {
   unauthenticated: 'Your session has ended. Sign in again.',
   notAvailable: 'That organization is not available to your account.',
   forbidden: 'Your organization role does not allow this action.',
+  switchFailed: 'The organization could not be switched. Your current session is unchanged; try again.',
 } as const;
 const UNAVAILABLE = fail(503, 'multi_organization_unavailable', organizationMessages.unavailable);
 const selectSchema = z.object({ organizationId: z.string().max(64) }).strict();
@@ -88,7 +96,9 @@ export class OrganizationAccessService {
       id: member.id, organizationId: r.context.organizationId, role: member.role,
       assignedContractorIds: manager ? await r.store.assignedContractorIds(member.id) : [],
       approvalAuthorized: manager && member.approvalAuthorized,
-      platformPrivileges: await r.store.platformPrivileges(member.authUserId),
+      // Sprint 3.0.1 (M1): the platform privilege belongs to the holder's ThriveSource membership only. A membership in
+      // any other organization never carries it, even for the designated holder.
+      platformPrivileges: r.context.organizationId === THRIVESOURCE_ORGANIZATION_ID ? await r.store.platformPrivileges(member.authUserId) : [],
     };
   }
 
@@ -108,9 +118,10 @@ export class OrganizationAccessService {
   }
 
   /**
-   * Switches the session to another organization of the same identity. The old session is revoked first, then a new
-   * session bound to the target membership is issued (fail closed: an error leaves the user signed out, never in two
-   * organizations or in the wrong one). Non-member, suspended, removed and inactive targets are indistinguishable.
+   * Switches the session to another organization of the same identity. In one transaction the old session is revoked
+   * conditionally and a new session bound to the target membership is issued with the OLD absolute expiry (Sprint 3.0.1).
+   * A replayed, concurrently switched, logged-out or administrator-revoked session yields 401 and no replacement; a
+   * database failure rolls back both steps. Non-member, suspended, removed and inactive targets are indistinguishable.
    */
   async selectOrganization(input: unknown, meta: RequestMeta): Promise<Outcome> {
     if (!this.available) return UNAVAILABLE;
@@ -140,16 +151,33 @@ export class OrganizationAccessService {
       return fail(403, 'organization_not_available', organizationMessages.notAvailable);
     }
 
-    await r.store.revokeSession(sha256Hex(meta.sessionToken!), 'organization_switched', now);
-    const token = newSessionToken(), cfg = this.deps.session;
-    await targetStore.createSession({
-      tokenHash: sha256Hex(token), memberId: member.id, now,
-      idleExpiresAt: new Date(now.getTime() + cfg.idleTimeoutSeconds * 1000),
-      absoluteExpiresAt: new Date(now.getTime() + cfg.absoluteTimeoutSeconds * 1000),
-    });
-    await r.store.audit({ eventType: 'organization_switch', outcome: 'success', actorMemberId: r.membership.memberId, subjectMemberId: r.membership.memberId, details: { direction: 'out' } }, now);
-    await targetStore.audit({ eventType: 'organization_switch', outcome: 'success', actorMemberId: member.id, subjectMemberId: member.id, details: { direction: 'in' } }, now);
-    return { status: 200, body: { organization: publicMembership(target, true) }, cookie: { set: token, maxAge: cfg.absoluteTimeoutSeconds } };
+    // Sprint 3.0.1 (H2, H3): one transaction. The source session is consumed conditionally (still valid, still this
+    // member's, not yet revoked by anyone); only the single winner issues a replacement, and the replacement keeps the
+    // source session's absolute expiry. Any failure rolls everything back, leaving the source session exactly as it was.
+    const token = newSessionToken(), cfg = this.deps.session, sourceHash = sha256Hex(meta.sessionToken!);
+    let switched: { absoluteExpiresAt: Date } | null;
+    try {
+      switched = await this.deps.transaction(async storeFor => {
+        const source = storeFor(r.context), destination = storeFor(targetContext);
+        const consumed = await source.consumeSession(sourceHash, r.membership.memberId, 'organization_switched', now);
+        if (!consumed) return null;
+        const absoluteExpiresAt = consumed.absoluteExpiresAt;
+        const idleExpiresAt = new Date(Math.min(now.getTime() + cfg.idleTimeoutSeconds * 1000, absoluteExpiresAt.getTime()));
+        await destination.createSession({ tokenHash: sha256Hex(token), memberId: member.id, now, idleExpiresAt, absoluteExpiresAt });
+        await source.audit({ eventType: 'organization_switch', outcome: 'success', actorMemberId: r.membership.memberId, subjectMemberId: r.membership.memberId, details: { direction: 'out' } }, now);
+        await destination.audit({ eventType: 'organization_switch', outcome: 'success', actorMemberId: member.id, subjectMemberId: member.id, details: { direction: 'in' } }, now);
+        return { absoluteExpiresAt };
+      });
+    } catch {
+      return fail(503, 'organization_switch_failed', organizationMessages.switchFailed);
+    }
+    // Lost the race, or the session was revoked or expired meanwhile: no replacement exists, and the caller is signed out.
+    if (!switched) {
+      await r.store.audit({ eventType: 'organization_switch', outcome: 'denied', actorMemberId: r.membership.memberId, subjectMemberId: r.membership.memberId, details: { reason: 'session_not_current' } }, now).catch(() => undefined);
+      return { ...fail(401, 'unauthenticated', organizationMessages.unauthenticated), cookie: 'clear' };
+    }
+    const maxAge = Math.max(1, Math.floor((switched.absoluteExpiresAt.getTime() - now.getTime()) / 1000));
+    return { status: 200, body: { organization: publicMembership(target, true) }, cookie: { set: token, maxAge } };
   }
 
   /** Seat usage of the session's organization. Administrators only. */

@@ -52,6 +52,7 @@ function wiring(h: Harness, capability: typeof cap | null = cap) {
   const storeFor = (c: OrganizationContext) => new PostgresAuthStore(sql, c);
   const service = new OrganizationAccessService({
     capability, directory: new IdentityDirectory(sql), storeFor, tenancyFor: c => new PostgresTenancyStore(sql, c),
+    transaction: fn => sql.transaction(tx => fn(c => new PostgresAuthStore(tx, c))),
     now: () => new Date(h.clock.now), session: { idleTimeoutSeconds: 1800, absoluteTimeoutSeconds: 43200 },
   });
   return { sql, storeFor, service };
@@ -94,7 +95,13 @@ describe('M8 proposal location and M1-M7 integrity', () => {
     expect(code).not.toMatch(/ROW LEVEL SECURITY|CREATE POLICY|ALTER ROLE|CREATE ROLE|OWNER TO|SECURITY DEFINER|DISABLE TRIGGER/i);
     expect(code).not.toMatch(/\bDROP TABLE (?!pg_temp\.hourvia_m8_baseline;)/i);
     expect(code).not.toMatch(/\bDROP\s+(?:COLUMN|FUNCTION|TRIGGER|INDEX)\b/i);
-    expect(code).not.toMatch(/^\s*(?:UPDATE|DELETE FROM|TRUNCATE)\b/im);
+    // No top-level data rewrite. Function bodies are excluded from that scan, and (Sprint 3.0.1) the only UPDATEs they
+    // contain are the two suspension revocations of auth_sessions; no function body deletes or truncates.
+    const bodies = [...code.matchAll(/CREATE (?:OR REPLACE )?FUNCTION[\s\S]*?AS \$\$([\s\S]*?)\n\$\$;/g)].map(m => m[1]!);
+    const topLevel = code.replace(/CREATE (?:OR REPLACE )?FUNCTION[\s\S]*?AS \$\$[\s\S]*?\n\$\$;/g, '');
+    expect(topLevel).not.toMatch(/^\s*(?:UPDATE|DELETE FROM|TRUNCATE)\b/im);
+    expect(bodies.join('\n')).not.toMatch(/\b(?:DELETE FROM|TRUNCATE)\b/i);
+    expect(bodies.flatMap(b => [...b.matchAll(/^\s*UPDATE ([a-z_]+) SET/gim)].map(m => m[1]))).toEqual(['auth_sessions', 'auth_sessions']);
     expect(code.match(/^GRANT .*$/gm)).toEqual([
       'GRANT SELECT (organization_id, plan, seat_limit, billing_expires_at) ON organization_seat_entitlements TO hourvia_auth_runtime;',
       'GRANT INSERT (organization_id) ON workspace_members, workspace_invitations, auth_sessions, auth_audit_events TO hourvia_auth_runtime;',
@@ -182,7 +189,7 @@ describe('M8 schema: organizations, global identities and tenant binding', () =>
     await expect(h.pg.query(`INSERT INTO workspace_members (workspace_id, email, role, status) VALUES ('acme', 'y@t.test', 'contractor', 'invited')`)).rejects.toThrow(/organization_workspace_fk/);
     // A session in Acme for a ThriveSource member, or an Acme invitation sent by a ThriveSource admin.
     await expect(h.pg.query(`INSERT INTO auth_sessions (organization_id, token_hash, member_id, created_at, last_seen_at, idle_expires_at, absolute_expires_at)
-      VALUES ($1, $2, $3, now(), now(), now() + interval '1 hour', now() + interval '2 hours')`, [ACME, 'a'.repeat(64), danaTs.id])).rejects.toThrow(/auth_sessions_member_org_fk/);
+      VALUES ($1, $2, $3, now(), now(), now() + interval '1 hour', now() + interval '2 hours')`, [ACME, 'a'.repeat(64), danaTs.id])).rejects.toThrow(/auth_sessions_member_org_fk|active member of an active organization/);
     await expect(h.pg.query(`INSERT INTO workspace_invitations (organization_id, workspace_id, member_id, email, role, status, invited_by_member_id, expires_at)
       VALUES ($1, 'acme', $2, 'owner@acme.test', 'workspace_admin', 'accepted', $3, now() + interval '1 day')`, [ACME, acmeAdmin.id, danaTs.id])).rejects.toThrow(/invited_by_org_fk|inviter is not authorized/);
   });
@@ -470,7 +477,9 @@ describe('production wiring stays single-organization', () => {
     const users = [...files('../../server/'), ...files('../../src/'), ...files('../../netlify/')]
       .filter(f => /\.(ts|tsx|mts)$/.test(f) && src(f).includes('mintMultiOrganizationCapabilityForOfflineTests'))
       .map(f => f.replace(/^(\.\.\/)+/, ''));
-    expect(users.sort()).toEqual(['server/auth/multi-organization.test.ts', 'src/domain/organization.ts', 'src/domain/tenancy.test.ts']);
+    expect(users.sort()).toEqual([
+      'server/auth/multi-organization-hardening.test.ts', 'server/auth/multi-organization.rehearsal.test.ts', 'server/auth/multi-organization.test.ts',
+      'src/domain/organization.ts', 'src/domain/tenancy.test.ts']);
   });
   it('no HTTP route, function or runtime path uses the multi-organization service or directory', () => {
     for (const f of ['../../netlify/functions/auth-api.mts', './http.ts', './runtime.ts', './service.ts', './config.ts', './store-postgres.ts']) {

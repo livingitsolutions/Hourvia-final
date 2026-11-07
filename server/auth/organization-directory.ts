@@ -21,7 +21,7 @@ export const LOCATE_SESSION_SQL = `SELECT s.id AS session_id, s.member_id, s.org
 export const IDENTITY_MEMBERSHIPS_SQL = `SELECT m.id AS member_id, m.organization_id, m.workspace_id, m.role, m.status,
  o.slug, o.name, o.kind, o.status AS organization_status
  FROM workspace_members m JOIN organizations o ON o.id = m.organization_id AND o.slug = m.workspace_id
- WHERE m.auth_user_id = $1 AND m.status IN ('active', 'suspended') ORDER BY o.name, o.id LIMIT 200`;
+ WHERE m.auth_user_id = $1 AND m.status IN ('active', 'suspended') AND o.status IN ('active', 'suspended') ORDER BY o.name, o.id LIMIT 200`;
 const IDENTITY_STATEMENTS = new Set([LOCATE_SESSION_SQL, IDENTITY_MEMBERSHIPS_SQL]);
 
 export class IdentityStatementRejectedError extends Error {
@@ -70,7 +70,11 @@ export class IdentityDirectory {
   /** inner is normally statementGuardedSqlClient(roleScopedSqlClient(pool)), exactly like the auth store. */
   constructor(inner: SqlClient) { this.sql = identityScopedSqlClient(inner); }
 
-  /** The session's own membership and every active or suspended membership of the same identity. Null if the session is not valid. */
+  /**
+   * The session's own membership and every active or suspended membership of the same identity, in organizations that are
+   * active or suspended. Memberships of closed or still-provisioning organizations are never listed (Sprint 3.0.1), so
+   * their names are not disclosed. Null if the session is not valid.
+   */
   async resolve(tokenHash: string, now: Date): Promise<ResolvedIdentity | null> {
     const located = await this.sql.query<{ session_id: string; member_id: string; organization_id: string; auth_user_id: string; workspace_id: string }>(LOCATE_SESSION_SQL, [tokenHash, now]);
     const row = located.rows[0];

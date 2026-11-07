@@ -116,3 +116,11 @@ Hourvia is organization-first. Every workspace belongs to an organization, and t
   - `src/domain/tenancy.ts` provides `assertTenantResource`, `scopeTenantResources` and `organizationCan`. The last applies the unchanged role rules after a strict same-organization check.
 - **Seats:** `organization_seat_entitlements` (M8). Active members consume seats, pending unexpired invitations reserve them, and suspended or disabled members don't count. Organizations are counted independently. M8 guards enforce the limit in the database. ThriveSource is `internal_unlimited`, and only the internal kind (ThriveSource) can hold that plan.
 - **Platform Super Admin:** unchanged and still single. M8 restricts the platform candidate to the designated mailbox's ThriveSource membership. Organization roles never yield a platform privilege, and the platform console still needs the holder's ThriveSource session.
+
+**Sprint 3.0.1 hardening (independent review findings)**
+- **Switching (H2, H3):** `selectOrganization` runs one transaction. `PostgresAuthStore.consumeSession` revokes the source session only if it is still valid and still the caller's member's; only that single winner creates the replacement, which keeps the source session's absolute expiry. Concurrent switches, replays, logout and administrator revocation leave no replacement; a failure rolls back both steps.
+- **Platform authority (M1):** platform privileges count only in the ThriveSource context, in `OrganizationAccessService.principal`, in `organizationCan` and in M8's `hourvia_member_authority`.
+- **Suspension (M2):** M8 revokes sessions when a member or organization is suspended (or closed), and refuses new sessions for inactive members or organizations.
+- **Tenant SQL (M3):** outside ThriveSource the analyzer itself requires an explicit, single-row, bare-parameter `organization_id` bound to the context.
+- **Isolation (M4):** M8's seat, session and suspension guards fail closed unless the transaction is `READ COMMITTED`.
+- **Directory (L2):** memberships of closed or provisioning organizations are not listed.

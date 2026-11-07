@@ -6,7 +6,7 @@
  * depends on migration M8 (db/proposals/sprint-3.0/), which is NOT applied in Sprint 3.0, so the server keeps every
  * multi-organization path unavailable (see MULTI_ORGANIZATION_AVAILABILITY in organization.ts).
  */
-import { parseOrganizationId, type OrganizationContext, type OrganizationId, type OrganizationKind, type OrganizationStatus } from './organization';
+import { THRIVESOURCE_ORGANIZATION_ID, parseOrganizationId, type OrganizationContext, type OrganizationId, type OrganizationKind, type OrganizationStatus } from './organization';
 import { roleCan, type Permission, type PlatformPrivilege, type Role } from './permissions';
 
 // ---------- Memberships ----------
@@ -68,11 +68,16 @@ export interface OrganizationPrincipal {
   platformPrivileges: readonly PlatformPrivilege[];
 }
 export interface OrganizationResourceScope { organizationId: unknown; contractorId?: string }
-/** Same role rules as the ThriveSource authorization, plus a strict same-organization requirement. */
+/**
+ * Same role rules as the ThriveSource authorization, plus a strict same-organization requirement. Sprint 3.0.1 (M1):
+ * platform privileges count only in the ThriveSource context. Outside it they are ignored even if a caller supplies
+ * them, so a customer-organization membership can never manage Administrators through the platform privilege.
+ */
 export function organizationCan(principal: OrganizationPrincipal | null, permission: Permission, resource: OrganizationResourceScope): boolean {
   if (!principal || !parseOrganizationId(principal.organizationId)) return false;
   if (parseOrganizationId(resource.organizationId) !== principal.organizationId) return false;
-  return roleCan(principal, permission, resource.contractorId);
+  const subject = principal.organizationId === THRIVESOURCE_ORGANIZATION_ID ? principal : { ...principal, platformPrivileges: [] };
+  return roleCan(subject, permission, resource.contractorId);
 }
 
 // ---------- Seat entitlements ----------

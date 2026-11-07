@@ -1,6 +1,6 @@
 # Hourvia operations status
 
-Last reconciled: Sprint 2.0C.2, 2026-11-05. This document records what is known about the production deployment, database and configuration, and how each fact is known. It authorizes no operation. Update it whenever a status changes, and keep the evidence class accurate.
+Last reconciled: Sprint 3.0.1, 2026-11-06. This document records what is known about the production deployment, database and configuration, and how each fact is known. It authorizes no operation. Update it whenever a status changes, and keep the evidence class accurate.
 
 ## Evidence classes
 
@@ -12,16 +12,19 @@ Last reconciled: Sprint 2.0C.2, 2026-11-05. This document records what is known 
 | **Access limitation** | Could not be checked because the access path returned 401. This is not evidence of a fault. |
 | **Unverified** | No direct evidence either way. |
 
-## Production identity (verified 2026-11-05)
+## Production identity (verified 2026-11-06)
 
 | Item | Value |
 |---|---|
 | Site | `hourvia-tracker` (`48d7a24b-6072-40bc-866f-0d6e43a921ea`) |
 | Canonical URL | https://hourvia.livingitsolutions.com (200) |
-| Production branch | `main` (auto-publish, not locked) |
-| Published deploy | `6aebe50abd9ac16c02942a31`, commit `6c22106d4e97eff0860c77b9f14b468e25209f67`, context `production`, database branch `production`, published 2026-11-05 02:08:34 UTC (re-verified 2026-11-05, Sprint 3.0 preflight) |
+| Production branch | `main`. Production publishing is **locked** on the published deploy below (verified 2026-11-06): a merge to `main` still builds a production deploy, but it is not published until the owner publishes it manually |
+| Published deploy | `6aebf26c137be0d868ccff2e`, commit `3fd11656743b799b8527dead246468e4cda20203` (PR #19, Sprint 3.0), context `production`, database branch `production`, published 2026-11-05 03:05:42 UTC, locked (re-verified 2026-11-06, Sprint 3.0.1) |
+| Previous published deploy | `6aebe50abd9ac16c02942a31`, commit `6c22106d4e97eff0860c77b9f14b468e25209f67` (Historical) |
+| GitHub `main` protection | Ruleset `26699501` "Hourvia - Protect Main Production", enforcement `active`, target default branch: pull request with 1 approval (last-push approval, stale reviews dismissed, threads resolved), no deletion, no force push (verified 2026-11-06 through the public API). Bypass actors: **Unverified** (visible to admins only) |
 | Known-good rollback deploy | `6aeb5cd4c8797713f23cc5b8` (same commit) |
-| Authentication | Fail-closed. `/api/auth/session`, `/api/admin/members` and `/api/platform/overview` return 503 `auth_unavailable` |
+| Authentication | Fail-closed. `/api/auth/session`, `/api/admin/members` and `/api/platform/overview` return 503 `auth_unavailable` (re-verified 2026-11-06) |
+| Multi-organization | Not available. No HTTP route; no runtime capability; M8 is a proposal outside the migrations directory |
 | Deploy secret scan | 94 files scanned, 0 matches |
 
 ## Migrations (verified in the repository)
@@ -50,7 +53,7 @@ These digests are pinned in `server/auth/production-database.ts` (`MIGRATION_DIG
 
 | Item | Owner-confirmed | Netlify metadata (verified) | Status |
 |---|---|---|---|
-| Nine variables (`HOURVIA_APP_ORIGIN`, `HOURVIA_AUTH_ALLOW_PRODUCTION`, `HOURVIA_AUTH_HASH_KEY`, `HOURVIA_AUTH_LAUNCH_STAGE`, `HOURVIA_AUTH_SMOKE_TEST_EMAILS`, `HOURVIA_EMAIL_DELIVERY_AUTHORIZED`, `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY`, `SUPABASE_URL`) | Production-only, Functions-scoped | Recreated 2026-11-05 02:06–02:07 UTC. Each has exactly one value in context `production`. Deploy Preview, branch deploy and dev resolve none of them. A newly built Deploy Preview (`6aebe84ee08c78e7856b04a8`) reported all nine absent at runtime. | Resolved for new deploys. Deploys built before 2026-11-05 02:06 UTC kept the earlier values. |
+| Nine variables (scopes re-check 2026-11-06: **Access limitation**, the environment-variable API returns no entries to Agent Runner; none of the nine is present in the Agent Runner environment) (`HOURVIA_APP_ORIGIN`, `HOURVIA_AUTH_ALLOW_PRODUCTION`, `HOURVIA_AUTH_HASH_KEY`, `HOURVIA_AUTH_LAUNCH_STAGE`, `HOURVIA_AUTH_SMOKE_TEST_EMAILS`, `HOURVIA_EMAIL_DELIVERY_AUTHORIZED`, `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY`, `SUPABASE_URL`) | Production-only, Functions-scoped | Recreated 2026-11-05 02:06–02:07 UTC. Each has exactly one value in context `production`. Deploy Preview, branch deploy and dev resolve none of them. A newly built Deploy Preview (`6aebe84ee08c78e7856b04a8`) reported all nine absent at runtime. | Resolved for new deploys. Deploys built before 2026-11-05 02:06 UTC kept the earlier values. |
 | `SUPABASE_SECRET_KEY` rotated, previous key revoked | Yes | Last updated 2026-11-04 17:14 UTC | Owner-confirmed |
 | `HOURVIA_SYNTHETIC_IDENTITY_POLICY`, `HOURVIA_PRODUCTION_DATABASE_EVIDENCE` | n/a | Not set | Correct for the current fail-closed state; both are required before any smoke activation |
 | Branch deploys | n/a | All branches build | Not yet aligned with the main-only policy |
@@ -64,7 +67,8 @@ The code refuses authentication outside a published production deploy on this si
 
 ## Release rules
 
-- Every merge to `main` is a production release. Netlify auto-publishes it and applies any new migration file to the production database.
+- Every merge to `main` builds a production deploy and may apply any new migration file to the production database. While production publishing is locked, the new deploy is not published until the owner publishes it. Whether a locked, unpublished production build still applies migrations is **Unverified**, so no migration may reach `main` without the steps below.
+- Agent PRs (opened by `netlify-coding[bot]`) need an approving review under the `main` ruleset. Do not merge an agent PR before its independent review.
 - Do not republish any deploy built before commit `e33fefc` (PR #15). Pre-M7 deploys conflict with the production ledger.
 - **Before any M8 or later migration reaches `main`:**
   1. `netlify db status --branch production --json`, run by the owner, shows exactly M1–M7 in order, with nothing pending, missing or out of order.
