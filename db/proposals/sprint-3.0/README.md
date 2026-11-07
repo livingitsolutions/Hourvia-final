@@ -1,6 +1,6 @@
 # Sprint 3.0 — M8 proposal: multi-organization memberships
 
-**Status: PROPOSAL. Not applied anywhere.** `20261106120000_multi-organization-memberships.sql` lives here, outside `netlify/database/migrations/`, so Netlify never applies it to a preview or production database branch. It has been exercised only on disposable embedded PostgreSQL (PGlite) in `server/auth/multi-organization.test.ts`.
+**Status: PROPOSAL. Not applied anywhere.** `20261106120000_multi-organization-memberships.sql` lives here, outside `netlify/database/migrations/`, so Netlify never applies it to a preview or production database branch. It has been exercised only on disposable databases: embedded PostgreSQL (PGlite) in `server/auth/multi-organization*.test.ts` and `server/auth/m8-security-closure.test.ts`, and throwaway local PostgreSQL 18 clusters created and deleted by `scripts/rehearsal/`.
 
 ## Dependencies
 
@@ -28,6 +28,8 @@
 | Platform authority (3.0.1) | `hourvia_member_authority` returns `platform_super_admin` only for the holder's **ThriveSource** Administrator membership. In a customer organization the same identity has plain `workspace_admin` authority, so it can't invite, promote, demote, disable or end sessions of Administrators there. |
 | Sessions (3.0.1) | New `BEFORE INSERT` guard on `auth_sessions`: the member and organization must be active (re-read under a shared per-organization advisory lock), the row must be unrevoked, and the absolute lifetime is at most 24 hours. |
 | Suspension (3.0.1) | Suspending a member, or suspending or closing an organization, revokes its unrevoked sessions in the same transaction (reasons `member_suspended`, `organization_suspended`, `organization_closed`), under the exclusive per-organization lock. Revocation is final, so reactivation never restores a session; users sign in again. The revocations are audited (authority `operator`). |
+| Disable (3.0.2, G1) | The member trigger (`workspace_members_status_session_revocation`, renamed from `workspace_members_suspension_revocation`) also fires on every transition into `disabled`: reason `member_disabled`, `revoked_by_member_id = disabled_by`, so the audit names the disabling Administrator with their authority (re-checked by the session guard for the runtime), or `operator` when operator SQL leaves `disabled_by` empty. Leaving `disabled` or `suspended` sweeps any still-unrevoked session (reason `member_reinstated`), which covers sessions left behind by a pre-3.0.2 non-atomic disable. Same exclusive lock as suspension. |
+| Session lifetime (3.0.2, G2) | The session insert guard refuses `created_at` more than 2 minutes ahead of the database clock (`clock_timestamp()`) and any absolute expiry beyond database time + 24 h 2 min, so a manipulated timestamp can't extend the cap. Past `created_at` only shortens a session. The self-check pins both. |
 | Isolation (3.0.1) | Seat consumers (pending invitation, activation, reactivation), session creation and suspension refuse to run unless `transaction_isolation` is `read committed`. The advisory locks are only sufficient at that level. |
 | Runtime inserts (3.0.1) | Outside ThriveSource, an application audit row must name an actor or subject member (then bound to the organization by the composite FKs). A member row the runtime inserts must have an invitation from an inviter by COMMIT (deferred constraint trigger), so the runtime can't create unauthorized member rows in any organization. |
 | Runtime grants | `INSERT (organization_id)` on `workspace_members`, `workspace_invitations`, `auth_sessions` and `auth_audit_events`. `SELECT (organization_id, plan, seat_limit, billing_expires_at)` on entitlements. Nothing else changes. |
@@ -47,7 +49,9 @@ Organizations are counted independently. An organization with no entitlement row
 - `hourvia_seats:<org>`, exclusive, taken by every seat consumer. It serializes the count-then-insert, so concurrent consumers can't over-allocate.
 - `hourvia_sessions:<org>`, shared for session creation and exclusive for suspension. A session committed concurrently with a suspension is either refused (suspension first) or revoked by it (session first).
 
-Both are verified on a disposable PostgreSQL 18 cluster by `scripts/rehearsal/multi-organization-rehearsal.sh`.
+Both are verified on a disposable PostgreSQL 18 cluster by `scripts/rehearsal/multi-organization-rehearsal.sh` (S1–S11). Sprint 3.0.2 adds deterministic interleavings for: switch winning before logout and the reverse; switch racing administrator revocation in both orders; organization suspension during an open switch transaction in both orders; and disable racing a switch, followed by reinstatement. `scripts/rehearsal/platform-grant-rehearsal.sh m8` runs the 16 AP-PSA-GRANT scenarios on M1–M7 + M8.
+
+**Known, accepted semantics (3.0.2).** Administrator session revocation (`revoke-sessions`) is point-in-time: a session committed after it (for example, a switch that was mid-transaction) is a new sign-in and stays valid (S9c). A lasting block is disable or suspension, which serialize with session creation under the per-organization lock (S10, S11).
 
 ## Backfill
 
