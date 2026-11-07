@@ -223,6 +223,22 @@ export class PostgresAuthStore implements AuthStore {
     return rows[0]?.member_id ?? null;
   }
 
+  /**
+   * Sprint 3.0.1 (organization switching): revokes this session only if it is still valid AND belongs to memberId, and
+   * returns its absolute expiry. Exactly one caller can win: a concurrent UPDATE of the same row waits for the winner,
+   * then re-evaluates "revoked_at IS NULL" and matches nothing. Null means the session was already revoked (logout,
+   * administrator, suspension, another switch), expired, or is not memberId's. Meant to run inside the transaction that
+   * issues the replacement, so either both happen or neither does.
+   */
+  async consumeSession(tokenHash: string, memberId: string, reason: string, now: Date): Promise<{ absoluteExpiresAt: Date } | null> {
+    const { rows } = await this.sql.query<{ absolute_expires_at: Date | string }>(
+      `UPDATE auth_sessions SET revoked_at = $2, revoked_reason = $3, revoked_by_member_id = member_id
+       WHERE token_hash = $1 AND organization_id = $5 AND member_id = $4 AND revoked_at IS NULL
+         AND idle_expires_at > $2 AND absolute_expires_at > $2 RETURNING absolute_expires_at`,
+      [tokenHash, now, reason, memberId, this.org]);
+    return rows.length === 1 ? { absoluteExpiresAt: new Date(rows[0]!.absolute_expires_at) } : null;
+  }
+
   async revokeMemberSessions(memberId: string, reason: string, now: Date, revokedBy: string) {
     const { rows } = await this.sql.query(`UPDATE auth_sessions SET revoked_at = $2, revoked_reason = $3, revoked_by_member_id = $4 WHERE member_id = $1 AND organization_id = $5 AND revoked_at IS NULL RETURNING id`, [memberId, now, reason, revokedBy, this.org]);
     return rows.length;

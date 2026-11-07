@@ -24,6 +24,10 @@
 --   * The runtime role gains INSERT on organization_id (never UPDATE) for the four tables it inserts into, and SELECT on
 --     four non-sensitive entitlement columns. Composite foreign keys keep every child row in its member's organization.
 --   * The platform candidate is restricted to the ThriveSource membership of the designated mailbox.
+--   * Sprint 3.0.1: platform authority (hourvia_member_authority) comes only from the ThriveSource membership; sessions
+--     are created only for active members of active organizations and at most 24 hours long; suspending a member or an
+--     organization revokes its sessions; seat, session and suspension paths require READ COMMITTED; runtime audit rows
+--     outside ThriveSource must name a member; runtime-created members need an authorized invitation by COMMIT.
 --
 -- What it deliberately does NOT do:
 --   * No organization is created, no row is moved or rewritten, and no audit row is touched. ADD COLUMN uses a
@@ -56,9 +60,35 @@ BEGIN
   IF to_regclass('public.organization_seat_entitlements') IS NOT NULL THEN
     RAISE EXCEPTION 'organization_seat_entitlements already exists; M8 must be applied exactly once to an M7 database';
   END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'organizations_single_tenant_m7' AND conrelid = 'public.organizations'::regclass)
-     OR NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'workspace_members_auth_user_id_key' AND contype = 'u') THEN
+  -- Sprint 3.0.1: every constraint this migration drops is checked by name, kind AND table.
+  IF (SELECT count(*) FROM pg_constraint c JOIN (VALUES
+        ('organizations_single_tenant_m7', 'organizations', 'c'),
+        ('workspace_members_auth_user_id_key', 'workspace_members', 'u'),
+        ('workspace_members_status_check', 'workspace_members', 'c'),
+        ('workspace_members_workspace_id_check', 'workspace_members', 'c'),
+        ('workspace_invitations_workspace_id_check', 'workspace_invitations', 'c'),
+        ('manager_assignments_workspace_id_check', 'manager_assignments', 'c'),
+        ('auth_audit_events_workspace_id_check', 'auth_audit_events', 'c')) AS e(name, tbl, kind)
+      ON c.conname = e.name AND c.conrelid = to_regclass('public.' || e.tbl) AND c.contype::text = e.kind) <> 7 THEN
     RAISE EXCEPTION 'the M7 single-organization constraints are not in their reviewed state; stop and review';
+  END IF;
+  -- Sprint 3.0.1: the M7 runtime boundary is intact (organization_id is never runtime-writable before M8) and the
+  -- ThriveSource column defaults that the deployed application relies on are present on all five tenant tables.
+  IF EXISTS (SELECT 1 FROM unnest(ARRAY['workspace_members', 'workspace_invitations', 'manager_assignments', 'auth_sessions', 'auth_audit_events']) t
+             WHERE has_column_privilege('hourvia_auth_runtime', 'public.' || t, 'organization_id', 'INSERT')
+                OR has_column_privilege('hourvia_auth_runtime', 'public.' || t, 'organization_id', 'UPDATE')) THEN
+    RAISE EXCEPTION 'hourvia_auth_runtime already holds an organization_id write privilege; stop and review';
+  END IF;
+  IF (SELECT count(*) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+      WHERE a.attname = 'organization_id' AND pg_get_expr(d.adbin, d.adrelid) = '''5adff49b-11d5-4b45-bb4f-2f76cfcca0c6''::uuid'
+        AND d.adrelid IN ('public.workspace_members'::regclass, 'public.workspace_invitations'::regclass, 'public.manager_assignments'::regclass,
+                          'public.auth_sessions'::regclass, 'public.auth_audit_events'::regclass)) <> 5 THEN
+    RAISE EXCEPTION 'the M7 ThriveSource organization_id defaults are not in their reviewed state; stop and review';
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_trigger WHERE NOT tgisinternal AND tgname IN ('auth_sessions_guard_insert', 'auth_audit_events_guard_insert',
+               'workspace_members_suspension_revocation', 'organizations_suspension_revocation', 'workspace_members_runtime_invitation',
+               'organization_seat_entitlements_guard', 'organization_seat_entitlements_no_truncate')) THEN
+    RAISE EXCEPTION 'an M8 trigger already exists; M8 must be applied exactly once to an M7 database';
   END IF;
   SELECT coalesce(array_agg(sig ORDER BY sig), '{}') INTO actual
   FROM (SELECT replace(p.proname || '(' || oidvectortypes(p.proargtypes) || ')', ', ', ',') AS sig
@@ -274,6 +304,11 @@ BEGIN
   END IF;
 
   IF NEW.status = 'active' AND OLD.status <> 'active' THEN
+    -- Sprint 3.0.1: the per-organization lock serializes seat consumers only if every later statement sees rows
+    -- committed while it waited, which holds under READ COMMITTED. Any other isolation level fails closed.
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+      RAISE EXCEPTION 'seat changes require READ COMMITTED isolation';
+    END IF;
     PERFORM pg_advisory_xact_lock(hashtextextended('hourvia_seats:' || NEW.organization_id::text, 0));
     SELECT e.plan, e.seat_limit, e.billing_expires_at INTO ent FROM organization_seat_entitlements e WHERE e.organization_id = NEW.organization_id;
     IF NOT FOUND THEN
@@ -311,6 +346,11 @@ BEGIN
     END IF;
   END IF;
   IF NEW.status = 'active' THEN
+    -- Sprint 3.0.1: the per-organization lock serializes seat consumers only if every later statement sees rows
+    -- committed while it waited, which holds under READ COMMITTED. Any other isolation level fails closed.
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+      RAISE EXCEPTION 'seat changes require READ COMMITTED isolation';
+    END IF;
     PERFORM pg_advisory_xact_lock(hashtextextended('hourvia_seats:' || NEW.organization_id::text, 0));
     SELECT e.plan, e.seat_limit, e.billing_expires_at INTO ent FROM organization_seat_entitlements e WHERE e.organization_id = NEW.organization_id;
     IF NOT FOUND THEN
@@ -365,6 +405,11 @@ BEGIN
   IF NEW.status = 'pending' THEN
     IF NOT EXISTS (SELECT 1 FROM organizations o WHERE o.id = NEW.organization_id AND o.status = 'active') THEN
       RAISE EXCEPTION 'invitations can be issued only in an active organization';
+    END IF;
+    -- Sprint 3.0.1: the per-organization lock serializes seat consumers only if every later statement sees rows
+    -- committed while it waited, which holds under READ COMMITTED. Any other isolation level fails closed.
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+      RAISE EXCEPTION 'seat changes require READ COMMITTED isolation';
     END IF;
     PERFORM pg_advisory_xact_lock(hashtextextended('hourvia_seats:' || NEW.organization_id::text, 0));
     SELECT e.plan, e.seat_limit, e.billing_expires_at INTO ent FROM organization_seat_entitlements e WHERE e.organization_id = NEW.organization_id;
@@ -478,14 +523,127 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, public, pg_temp AS $$
       AND m.status = 'active' AND m.activated_at IS NOT NULL);
 $$;
 
+-- 7a. Sprint 3.0.1 (M1): platform authority exists only in the ThriveSource membership ---------------------------------
+-- Before M8 every membership was ThriveSource, so the M4 body could not leak. With customer organizations it would:
+-- the holder's Administrator membership in a customer organization would inherit 'platform_super_admin' there. That
+-- membership now yields plain 'workspace_admin' authority. Signature, owner and EXECUTE grants are unchanged.
+CREATE OR REPLACE FUNCTION hourvia_member_authority(actor uuid, organization text) RETURNS text
+LANGUAGE sql STABLE SET search_path = pg_catalog, public, pg_temp AS $$
+  SELECT CASE
+    WHEN m.organization_id = '5adff49b-11d5-4b45-bb4f-2f76cfcca0c6'::uuid AND m.workspace_id = 'thrivesource'
+     AND EXISTS (SELECT 1 FROM platform_privileges p WHERE p.auth_user_id = m.auth_user_id AND p.privilege = 'platform_super_admin' AND p.revoked_at IS NULL)
+      THEN 'platform_super_admin' ELSE 'workspace_admin' END
+  FROM workspace_members m
+  WHERE m.id = actor AND m.workspace_id = organization AND m.status = 'active' AND m.role = 'workspace_admin' AND m.auth_user_id IS NOT NULL;
+$$;
+
+-- 7b. Sprint 3.0.1 (H2, H3, M2): session creation and suspension ---------------------------------------------------------
+-- Lock protocol, per organization: every session INSERT takes the 'hourvia_sessions:<org>' advisory lock SHARED and then
+-- re-reads the member and organization; a suspension takes it EXCLUSIVE before revoking. Under READ COMMITTED each
+-- statement sees rows committed while it waited, so a session committed concurrently with a suspension is either
+-- refused (suspension first) or revoked by it (session first). It can never survive the suspension.
+CREATE FUNCTION hourvia_guard_session_insert() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$
+BEGIN
+  IF current_setting('transaction_isolation') <> 'read committed' THEN
+    RAISE EXCEPTION 'session creation requires READ COMMITTED isolation';
+  END IF;
+  IF NEW.revoked_at IS NOT NULL OR NEW.revoked_reason IS NOT NULL OR NEW.revoked_by_member_id IS NOT NULL THEN
+    RAISE EXCEPTION 'sessions must be created unrevoked';
+  END IF;
+  -- Upper bound of the configurable absolute lifetime (config.ts allows at most 86400 seconds).
+  IF NEW.absolute_expires_at > NEW.created_at + interval '24 hours' THEN
+    RAISE EXCEPTION 'session absolute lifetime exceeds 24 hours';
+  END IF;
+  PERFORM pg_advisory_xact_lock_shared(hashtextextended('hourvia_sessions:' || NEW.organization_id::text, 0));
+  IF NOT EXISTS (SELECT 1 FROM workspace_members m JOIN organizations o ON o.id = m.organization_id
+                 WHERE m.id = NEW.member_id AND m.organization_id = NEW.organization_id AND m.status = 'active'
+                   AND m.auth_user_id IS NOT NULL AND o.status = 'active') THEN
+    RAISE EXCEPTION 'sessions can be created only for an active member of an active organization';
+  END IF;
+  RETURN NEW;
+END
+$$;
+CREATE TRIGGER auth_sessions_guard_insert BEFORE INSERT ON auth_sessions
+  FOR EACH ROW EXECUTE FUNCTION hourvia_guard_session_insert();
+
+-- Suspension is final for existing sessions: they are revoked (revocation is immutable), so reactivation can only ever
+-- lead to a fresh sign-in. Revocations are audited by the existing session revocation trigger (authority 'operator').
+CREATE FUNCTION hourvia_revoke_member_sessions() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$
+BEGIN
+  IF current_setting('transaction_isolation') <> 'read committed' THEN
+    RAISE EXCEPTION 'suspension requires READ COMMITTED isolation';
+  END IF;
+  PERFORM pg_advisory_xact_lock(hashtextextended('hourvia_sessions:' || NEW.organization_id::text, 0));
+  UPDATE auth_sessions SET revoked_at = now(), revoked_reason = 'member_suspended'
+   WHERE member_id = NEW.id AND organization_id = NEW.organization_id AND revoked_at IS NULL;
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER workspace_members_suspension_revocation AFTER UPDATE OF status ON workspace_members
+  FOR EACH ROW WHEN (NEW.status = 'suspended' AND OLD.status IS DISTINCT FROM 'suspended')
+  EXECUTE FUNCTION hourvia_revoke_member_sessions();
+
+CREATE FUNCTION hourvia_revoke_organization_sessions() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$
+BEGIN
+  IF current_setting('transaction_isolation') <> 'read committed' THEN
+    RAISE EXCEPTION 'organization suspension requires READ COMMITTED isolation';
+  END IF;
+  PERFORM pg_advisory_xact_lock(hashtextextended('hourvia_sessions:' || NEW.id::text, 0));
+  UPDATE auth_sessions SET revoked_at = now(), revoked_reason = 'organization_' || NEW.status
+   WHERE organization_id = NEW.id AND revoked_at IS NULL;
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER organizations_suspension_revocation AFTER UPDATE OF status ON organizations
+  FOR EACH ROW WHEN (OLD.status = 'active' AND NEW.status <> 'active')
+  EXECUTE FUNCTION hourvia_revoke_organization_sessions();
+
+-- 7c. Sprint 3.0.1 (L1): runtime INSERTs that no foreign key ties to an authorized member -----------------------------
+-- Audit: outside ThriveSource an application audit row must name an actor or subject member. The composite foreign
+-- keys then bind it to that member's organization. Pre-authentication events (no member) exist only in ThriveSource.
+CREATE FUNCTION hourvia_guard_audit_insert() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$
+BEGIN
+  IF current_user = 'hourvia_auth_runtime' AND NEW.organization_id IS DISTINCT FROM '5adff49b-11d5-4b45-bb4f-2f76cfcca0c6'::uuid
+     AND NEW.actor_member_id IS NULL AND NEW.subject_member_id IS NULL THEN
+    RAISE EXCEPTION 'application audit events outside ThriveSource must name a member of that organization';
+  END IF;
+  RETURN NEW;
+END
+$$;
+CREATE TRIGGER auth_audit_events_guard_insert BEFORE INSERT ON auth_audit_events
+  FOR EACH ROW EXECUTE FUNCTION hourvia_guard_audit_insert();
+
+-- Members: a member row the application creates must, by COMMIT, carry an invitation from an inviter whose authority
+-- the invitation guard checked. The WHEN clause of a constraint trigger is evaluated at INSERT time, so this applies
+-- exactly to rows the runtime inserted; operator bootstrap SQL is unaffected.
+CREATE FUNCTION hourvia_require_member_invitation() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM workspace_invitations i
+                 WHERE i.member_id = NEW.id AND i.organization_id = NEW.organization_id AND i.invited_by_member_id IS NOT NULL) THEN
+    RAISE EXCEPTION 'application-created members need an authorized invitation in the same transaction';
+  END IF;
+  RETURN NULL;
+END
+$$;
+CREATE CONSTRAINT TRIGGER workspace_members_runtime_invitation AFTER INSERT ON workspace_members
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (current_user = 'hourvia_auth_runtime')
+  EXECUTE FUNCTION hourvia_require_member_invitation();
+
 -- 8. Privileges ------------------------------------------------------------------------------------------------------------
 REVOKE ALL ON organization_seat_entitlements FROM PUBLIC;
-REVOKE ALL ON FUNCTION hourvia_guard_seat_entitlement() FROM PUBLIC;
+REVOKE ALL ON FUNCTION hourvia_guard_seat_entitlement(), hourvia_guard_session_insert(), hourvia_revoke_member_sessions(),
+  hourvia_revoke_organization_sessions(), hourvia_guard_audit_insert(), hourvia_require_member_invitation() FROM PUBLIC;
 DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'netlifydb_readonly') THEN
     REVOKE ALL ON organization_seat_entitlements FROM netlifydb_readonly;
-    REVOKE ALL ON FUNCTION hourvia_guard_seat_entitlement() FROM netlifydb_readonly;
+    REVOKE ALL ON FUNCTION hourvia_guard_seat_entitlement(), hourvia_guard_session_insert(), hourvia_revoke_member_sessions(),
+      hourvia_revoke_organization_sessions(), hourvia_guard_audit_insert(), hourvia_require_member_invitation() FROM netlifydb_readonly;
   END IF;
 END
 $$;
@@ -570,12 +728,22 @@ BEGIN
         'platform_privileges_audit', 'platform_privileges_no_truncate', 'platform_super_admin_designation_guard',
         'platform_super_admin_designation_audit', 'platform_super_admin_designation_no_truncate',
         'organizations_guard', 'organizations_no_truncate', 'organization_seat_entitlements_guard',
-        'organization_seat_entitlements_no_truncate')) <> 20 THEN
+        'organization_seat_entitlements_no_truncate', 'auth_sessions_guard_insert', 'auth_audit_events_guard_insert',
+        'workspace_members_suspension_revocation', 'organizations_suspension_revocation', 'workspace_members_runtime_invitation')) <> 25 THEN
     RAISE EXCEPTION 'self-check failed: guard or audit triggers are missing or disabled';
   END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'workspace_members_runtime_invitation' AND tgconstraint <> 0 AND tgdeferrable AND tginitdeferred
+                 AND tgrelid = 'public.workspace_members'::regclass) THEN
+    RAISE EXCEPTION 'self-check failed: the runtime invitation constraint trigger is not deferred';
+  END IF;
+  -- 9d'. M1: platform authority never comes from a customer membership (behavioural check of the replaced body).
+  IF pg_get_functiondef('public.hourvia_member_authority(uuid, text)'::regprocedure) NOT LIKE '%m.organization_id = ''5adff49b-11d5-4b45-bb4f-2f76cfcca0c6''::uuid%' THEN
+    RAISE EXCEPTION 'self-check failed: hourvia_member_authority is not restricted to ThriveSource';
+  END IF;
 
-  -- 9e. Functions: the 16 M7 functions plus hourvia_guard_seat_entitlement; pinned; SECURITY DEFINER and EXECUTE unchanged.
-  IF (SELECT count(*) FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace AND p.proname LIKE 'hourvia\_%') <> 17 THEN
+  -- 9e. Functions: the 16 M7 functions plus the six M8 trigger functions (seat entitlement, session insert, member and
+  -- organization suspension revocation, audit insert, member invitation); pinned; SECURITY DEFINER and EXECUTE unchanged.
+  IF (SELECT count(*) FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace AND p.proname LIKE 'hourvia\_%') <> 22 THEN
     RAISE EXCEPTION 'self-check failed: unexpected number of hourvia_* functions';
   END IF;
   FOR r IN SELECT p.oid::regprocedure AS f, p.proconfig, p.prosecdef, p.proname, pg_get_userbyid(p.proowner) AS owner

@@ -69,7 +69,8 @@ interface Reference { table: ScopedTable; qualifier: string; clause: string; ind
 
 /**
  * Options. allowOrganizationInsert (Sprint 3.0, default false) permits INSERTs that name organization_id as a bare
- * parameter. assertTenantStatement enables it only for contexts other than ThriveSource (they need the M8 grant); the
+ * parameter, and (Sprint 3.0.1) REQUIRES it: with the option set, an INSERT without organization_id is rejected.
+ * assertTenantStatement enables it exactly for contexts other than ThriveSource (they need the M8 grant); the
  * ThriveSource context keeps the Sprint 2.0B rule that organization_id is never written.
  */
 export interface TenantStatementOptions { allowOrganizationInsert?: boolean }
@@ -113,10 +114,13 @@ export function analyzeTenantStatement(text: string, options: TenantStatementOpt
     if (!columns) throw new TenantStatementRejectedError('insert_column_list');
     const names = columns[1]!.split(',').map(c => c.trim());
     const position = names.indexOf('organization_id');
-    if (position < 0 || !options.allowOrganizationInsert) {
+    if (!options.allowOrganizationInsert) {
       if (/\borganization_id\b/.test(columns[1]!)) throw new TenantStatementRejectedError('organization_id_assignment');
       return { kind: 'default_insert', tables: [target.table], organizationParams: [] };
     }
+    // Sprint 3.0.1 (M3): outside ThriveSource the M7 column default (ThriveSource) is never acceptable, so the analyzer
+    // itself refuses an INSERT that omits organization_id, not only the run-time check in assertTenantStatement.
+    if (position < 0) throw new TenantStatementRejectedError('organization_id_required');
     // Explicit organization: exactly one VALUES row, and the organization_id item must be a bare $n (no expression,
     // no subquery, no literal), so the run-time check below binds it to the context.
     if (names.filter(n => n === 'organization_id').length !== 1 || /\bselect\b/.test(lower.slice(target.index + columns[0].length))) {

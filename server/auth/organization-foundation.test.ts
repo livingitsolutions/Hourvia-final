@@ -506,7 +506,8 @@ describe('static tenant predicates', () => {
   });
   it('a default-derived INSERT is refused outside the ThriveSource context', () => {
     const foreign = Object.freeze({ organizationId: OTHER, legacyWorkspaceId: 'thrivesource', source: 'membership' }) as unknown as OrganizationContext;
-    expect(() => assertTenantStatement(`INSERT INTO auth_sessions (token_hash) VALUES ($1)`, ['x'], foreign)).toThrow(/default_organization_insert/);
+    // Sprint 3.0.1: the analyzer now refuses it first (organization_id_required); the run-time check remains behind it.
+    expect(() => assertTenantStatement(`INSERT INTO auth_sessions (token_hash) VALUES ($1)`, ['x'], foreign)).toThrow(/organization_id_required|default_organization_insert/);
     expect(() => assertTenantStatement(`SELECT m.id FROM workspace_members m WHERE m.organization_id = $1`, [TS], foreign)).toThrow(/organization_parameter/);
   });
   it('the scoped client rejects before the database is contacted, inside transactions too', async () => {

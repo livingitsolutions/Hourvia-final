@@ -115,7 +115,13 @@ describe('organization-scoped authorization', () => {
     expect(organizationCan({ ...admin, organizationId: 'acme' as OrganizationId }, 'dashboard', { organizationId: 'acme' })).toBe(false);
   });
   it('an organization role never implies a platform privilege, and the ThriveSource authorization is unchanged', () => {
-    expect(organizationCan({ ...admin, platformPrivileges: ['platform_super_admin'] }, 'administrators.manage', { organizationId: ACME })).toBe(true);
+    // Sprint 3.0.1 (M1): the platform privilege counts only in ThriveSource. A customer Administrator never manages
+    // Administrators through it, even if a caller supplies it; the ThriveSource holder still can.
+    expect(organizationCan({ ...admin, platformPrivileges: ['platform_super_admin'] }, 'administrators.manage', { organizationId: ACME })).toBe(false);
+    expect(organizationCan({ ...admin, platformPrivileges: ['platform_super_admin'] }, 'workspace.manage', { organizationId: ACME })).toBe(true);
+    const holder: OrganizationPrincipal = { ...admin, organizationId: TS, platformPrivileges: ['platform_super_admin'] };
+    expect(organizationCan(holder, 'administrators.manage', { organizationId: TS })).toBe(true);
+    expect(organizationCan(holder, 'administrators.manage', { organizationId: ACME })).toBe(false);
     const p: Principal = { id: 'a', name: 'A', role: 'workspace_admin', workspaceId: 'thrivesource', assignedContractorIds: [], approvalAuthorized: false };
     expect(authorization.can(p, 'workspace.manage', { workspaceId: 'thrivesource' })).toBe(true);
     expect(authorization.can(p, 'administrators.manage', { workspaceId: 'thrivesource' })).toBe(false);

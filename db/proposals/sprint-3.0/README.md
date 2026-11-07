@@ -25,6 +25,11 @@
 | Seats | New `organization_seat_entitlements` table, with plan `internal_unlimited` (ThriveSource only, no limit, no billing expiry) or `standard` (customer, 1–100000 seats, optional billing expiry). Guards on member insert or activation and on pending-invitation insert enforce the limit under a per-organization advisory lock. |
 | Audit triggers | `hourvia_audit_member_change` and `hourvia_audit_session_revocation` write the member's `organization_id` explicitly. These were the Sprint 2.0C prerequisites found in M7 testing. |
 | Platform | `hourvia_is_verified_platform_candidate` accepts only the designated mailbox's **ThriveSource** membership. A same-email membership in another organization can never be designated or granted. |
+| Platform authority (3.0.1) | `hourvia_member_authority` returns `platform_super_admin` only for the holder's **ThriveSource** Administrator membership. In a customer organization the same identity has plain `workspace_admin` authority, so it can't invite, promote, demote, disable or end sessions of Administrators there. |
+| Sessions (3.0.1) | New `BEFORE INSERT` guard on `auth_sessions`: the member and organization must be active (re-read under a shared per-organization advisory lock), the row must be unrevoked, and the absolute lifetime is at most 24 hours. |
+| Suspension (3.0.1) | Suspending a member, or suspending or closing an organization, revokes its unrevoked sessions in the same transaction (reasons `member_suspended`, `organization_suspended`, `organization_closed`), under the exclusive per-organization lock. Revocation is final, so reactivation never restores a session; users sign in again. The revocations are audited (authority `operator`). |
+| Isolation (3.0.1) | Seat consumers (pending invitation, activation, reactivation), session creation and suspension refuse to run unless `transaction_isolation` is `read committed`. The advisory locks are only sufficient at that level. |
+| Runtime inserts (3.0.1) | Outside ThriveSource, an application audit row must name an actor or subject member (then bound to the organization by the composite FKs). A member row the runtime inserts must have an invitation from an inviter by COMMIT (deferred constraint trigger), so the runtime can't create unauthorized member rows in any organization. |
 | Runtime grants | `INSERT (organization_id)` on `workspace_members`, `workspace_invitations`, `auth_sessions` and `auth_audit_events`. `SELECT (organization_id, plan, seat_limit, billing_expires_at)` on entitlements. Nothing else changes. |
 
 **Seat rule.** These consume a seat:
@@ -37,6 +42,12 @@ These do not consume a seat:
 - disabled members.
 
 Organizations are counted independently. An organization with no entitlement row can't invite or activate anyone, so it fails closed. Re-sending an invitation replaces its own reservation.
+
+**Lock protocol (3.0.1).** Two advisory locks, per organization:
+- `hourvia_seats:<org>`, exclusive, taken by every seat consumer. It serializes the count-then-insert, so concurrent consumers can't over-allocate.
+- `hourvia_sessions:<org>`, shared for session creation and exclusive for suspension. A session committed concurrently with a suspension is either refused (suspension first) or revoked by it (session first).
+
+Both are verified on a disposable PostgreSQL 18 cluster by `scripts/rehearsal/multi-organization-rehearsal.sh`.
 
 ## Backfill
 
@@ -57,7 +68,7 @@ The self-check compares counts and content fingerprints of all ten affected tabl
   4. **Service.** The organization context is derived from the session. A client-supplied organization id is only a switch *request*, matched against the identity's own memberships.
 
   Adding RLS later as defence in depth is a separate decision for a future sprint.
-- **Administrator management** still requires an Administrator membership *in the same organization* plus the platform privilege, which is unchanged from M4. **Open product decision:** whether customer organizations should get an organization-owner role able to manage their own Administrators. M8 does not add one.
+- **Administrator management** still requires an Administrator membership *in the same organization* plus the platform privilege, which since Sprint 3.0.1 only counts in ThriveSource. So nobody can manage Administrators of a customer organization through the application; until an owner role exists, that is operator SQL only. **Open product decision:** whether customer organizations should get an organization-owner role able to manage their own Administrators. M8 does not add one.
 - `hourvia_platform_overview` still reports ThriveSource counts only. That is unchanged and harmless.
 
 ## Promotion and forward-only deployment strategy
@@ -82,3 +93,4 @@ The self-check compares counts and content fingerprints of all ten affected tabl
 - **Code compatibility:** M8 keeps the ThriveSource defaults and every runtime grant, so the Sprint 2.0B and 3.0 application code (ThriveSource-only HTTP paths) keeps working unchanged on an M8 database. A test covers this.
 - **Irreversibility:** once any identity holds memberships in two organizations, or a second organization or entitlement exists, global `auth_user_id` uniqueness and `organizations_single_tenant_m7` can't be restored without deleting tenant data. Any undo must be a reviewed forward migration.
 - Operator reinstatement or unsuspension into a full organization is refused by the seat guard. The operator must free a seat or raise the entitlement first.
+- Operator SQL that suspends members or organizations, or reactivates or reinstates members, must run at `READ COMMITTED` (the PostgreSQL default). Any other level is refused.
