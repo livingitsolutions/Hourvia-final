@@ -576,4 +576,50 @@ describe.skipIf(!enabled)('Sprint 3.0.1 M8 concurrency rehearsal on a disposable
       } finally { dis2.release(); await dis2.pool.end(); }
     });
   }, 120_000);
+  // ---- Sprint 3.0.5: invitation state machine under real concurrency ---------------------------------------------------
+  it('S12. concurrent acceptance on separate backends: exactly one wins; a racing second acceptance or revoke is refused', async () => {
+    await withScenario('s12', 20, async s => {
+      const a = await s.seed(ACME, 'acme', 'owner@acme.test', 'workspace_admin');
+      // (a) 10 application acceptances of one invitation at once: exactly one activates the member.
+      const m = await invitation(s, a.id, 'race@acme.test');
+      const out = await Promise.all(Array.from({ length: 10 }, () => settle(s.acme.acceptInvitation(m.id, new Date()))));
+      log('S12a', JSON.stringify(out.map(o => o.ok ? o.v : o.e)));
+      expect(out.filter(o => o.ok && o.v === true)).toHaveLength(1);
+      expect(out.every(o => o.ok)).toBe(true);
+      expect((await s.mon.query(`SELECT count(*)::int n FROM workspace_invitations WHERE member_id = $1 AND status = 'accepted'`, [m.id])).rows[0].n).toBe(1);
+
+      // (b)-(d) raw runtime statements WITHOUT the status filter, deterministically interleaved on the row lock.
+      const raceOnce = async (email: string, first: string, level: string) => {
+        const x = await invitation(s, a.id, email);
+        const c1 = client(s.db), c2 = client(s.db);
+        await c1.connect(); await c2.connect();
+        try {
+          const pid2 = (await c2.query<{ p: number }>(`SELECT pg_backend_pid() p`)).rows[0]!.p;
+          await c1.query('BEGIN'); await c1.query('SET LOCAL ROLE hourvia_auth_runtime');
+          await c1.query(first, [x.id]);
+          await c2.query(`BEGIN ISOLATION LEVEL ${level}`); await c2.query('SET LOCAL ROLE hourvia_auth_runtime');
+          const second = settle(c2.query(`UPDATE workspace_invitations SET status = 'accepted', accepted_at = now() WHERE member_id = $1`, [x.id]));
+          const blocked = await s.waitBlocked(pid2);
+          await c1.query('COMMIT');
+          const r = await second;
+          await c2.query('ROLLBACK');
+          const final = (await s.mon.query<{ status: string }>(`SELECT status FROM workspace_invitations WHERE member_id = $1`, [x.id])).rows.map(r => r.status);
+          return { blocked, r, final };
+        } finally { await c1.end(); await c2.end(); }
+      };
+      const accept = `UPDATE workspace_invitations SET status = 'accepted', accepted_at = now() WHERE member_id = $1`;
+      const revoke = `UPDATE workspace_invitations SET status = 'revoked' WHERE member_id = $1`;
+      const b = await raceOnce('b@acme.test', accept, 'READ COMMITTED');
+      const c = await raceOnce('c@acme.test', revoke, 'READ COMMITTED');
+      const d = await raceOnce('d@acme.test', accept, 'REPEATABLE READ');
+      log('S12b-d', JSON.stringify({ b: [b.blocked, b.r], c: [c.blocked, c.r], d: [d.blocked, d.r] }));
+      for (const x of [b, c, d]) expect(x.blocked.w).toBe('Lock');
+      expect(b.r.ok).toBe(false); expect((b.r as { e: string }).e).toMatch(/acceptance is final/);
+      expect(b.final).toEqual(['accepted']);
+      expect(c.r.ok).toBe(false); expect((c.r as { e: string }).e).toMatch(/accepted and revoked invitations are final/);
+      expect(c.final).toEqual(['revoked']);
+      expect(d.r.ok).toBe(false); expect((d.r as { e: string }).e).toMatch(/could not serialize access/);
+      expect(d.final).toEqual(['accepted']);
+    });
+  }, 120_000);
 });

@@ -32,6 +32,10 @@
 --     like suspension; leaving 'disabled' or 'suspended' sweeps any session that is still unrevoked, so reinstatement
 --     never restores an old session. The 24-hour session cap is anchored to the database clock: created_at may not lie
 --     in the future, so a supplied timestamp cannot extend the lifetime.
+--   * Sprint 3.0.5: invitations follow a forward-only state machine (pending -> accepted once and unexpired, or
+--     pending -> revoked; accepted and revoked are final; other columns immutable). The self-check additionally pins the
+--     organization suspension revocation (exclusive lock, trigger), the session insert guard's shared lock and fresh
+--     member/organization status re-check, the invitation guard, and the two new indexes.
 --
 -- What it deliberately does NOT do:
 --   * No organization is created, no row is moved or rewritten, and no audit row is touched. ADD COLUMN uses a
@@ -91,7 +95,7 @@ BEGIN
   END IF;
   IF EXISTS (SELECT 1 FROM pg_trigger WHERE NOT tgisinternal AND tgname IN ('auth_sessions_guard_insert', 'auth_audit_events_guard_insert',
                'workspace_members_status_session_revocation', 'organizations_suspension_revocation', 'workspace_members_runtime_invitation',
-               'organization_seat_entitlements_guard', 'organization_seat_entitlements_no_truncate')) THEN
+               'organization_seat_entitlements_guard', 'organization_seat_entitlements_no_truncate', 'workspace_invitations_guard_update')) THEN
     RAISE EXCEPTION 'an M8 trigger already exists; M8 must be applied exactly once to an M7 database';
   END IF;
   SELECT coalesce(array_agg(sig ORDER BY sig), '{}') INTO actual
@@ -438,6 +442,62 @@ BEGIN
 END
 $$;
 
+-- 5a. Sprint 3.0.5 (M-2): invitation state machine. Before M8 only INSERT was guarded, and the runtime holds
+-- UPDATE (status, accepted_at), so a revoked or accepted invitation could be put back to 'pending' (re-reserving a
+-- seat without the insert guard's seat, organization and inviter checks) or accepted after expiry. For every role:
+--   * pending -> accepted: once, unexpired by the database clock AND at the claimed acceptance time, accepted_at between
+--     creation and database time (2 minutes of application/database clock-skew tolerance on both sides; a back-dated
+--     accepted_at can never revive an expired invitation, because expiry is judged at the later of the two times),
+--     for the invited, linked member of an active organization (same role);
+--   * pending -> revoked;
+--   * accepted and revoked are final; every other column is immutable.
+-- A no-op update (nothing changes) is allowed. Seats are unaffected: acceptance converts the member's own reservation,
+-- and the activation that follows is re-counted by hourvia_guard_member_update under the seat lock. Two concurrent
+-- acceptances serialize on the row lock; under READ COMMITTED the loser re-reads the accepted row and is refused here
+-- (or matches no row when it filters on status = 'pending').
+CREATE FUNCTION hourvia_guard_invitation_update() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$
+BEGIN
+  IF NEW.id IS DISTINCT FROM OLD.id OR NEW.organization_id IS DISTINCT FROM OLD.organization_id
+     OR NEW.workspace_id IS DISTINCT FROM OLD.workspace_id OR NEW.member_id IS DISTINCT FROM OLD.member_id
+     OR NEW.email IS DISTINCT FROM OLD.email OR NEW.role IS DISTINCT FROM OLD.role
+     OR NEW.invited_by_member_id IS DISTINCT FROM OLD.invited_by_member_id
+     OR NEW.created_at IS DISTINCT FROM OLD.created_at OR NEW.expires_at IS DISTINCT FROM OLD.expires_at THEN
+    RAISE EXCEPTION 'workspace_invitations identity columns are immutable';
+  END IF;
+  IF NEW.status IS NOT DISTINCT FROM OLD.status THEN
+    IF NEW.accepted_at IS DISTINCT FROM OLD.accepted_at THEN
+      RAISE EXCEPTION 'invitation acceptance is final';
+    END IF;
+    RETURN NEW;
+  END IF;
+  IF OLD.status <> 'pending' THEN
+    RAISE EXCEPTION 'accepted and revoked invitations are final';
+  END IF;
+  IF NEW.status = 'revoked' THEN
+    RETURN NEW;
+  END IF;
+  IF NEW.status IS DISTINCT FROM 'accepted' THEN
+    RAISE EXCEPTION 'invitation status transition is not permitted';
+  END IF;
+  IF NEW.accepted_at IS NULL OR NEW.accepted_at < OLD.created_at - interval '2 minutes'
+     OR NEW.accepted_at > clock_timestamp() + interval '2 minutes' THEN
+    RAISE EXCEPTION 'invitation accepted_at must lie between its creation and the database clock';
+  END IF;
+  IF OLD.expires_at <= greatest(now(), NEW.accepted_at) THEN
+    RAISE EXCEPTION 'expired invitations cannot be accepted';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM workspace_members m JOIN organizations o ON o.id = m.organization_id
+                 WHERE m.id = OLD.member_id AND m.organization_id = OLD.organization_id AND m.workspace_id = OLD.workspace_id
+                   AND m.status = 'invited' AND m.role = OLD.role AND m.auth_user_id IS NOT NULL AND o.status = 'active') THEN
+    RAISE EXCEPTION 'invitations can be accepted only by the invited member of an active organization';
+  END IF;
+  RETURN NEW;
+END
+$$;
+CREATE TRIGGER workspace_invitations_guard_update BEFORE UPDATE ON workspace_invitations
+  FOR EACH ROW EXECUTE FUNCTION hourvia_guard_invitation_update();
+
 CREATE OR REPLACE FUNCTION hourvia_guard_session_update() RETURNS trigger
 LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$
 DECLARE
@@ -675,13 +735,15 @@ CREATE CONSTRAINT TRIGGER workspace_members_runtime_invitation AFTER INSERT ON w
 -- 8. Privileges ------------------------------------------------------------------------------------------------------------
 REVOKE ALL ON organization_seat_entitlements FROM PUBLIC;
 REVOKE ALL ON FUNCTION hourvia_guard_seat_entitlement(), hourvia_guard_session_insert(), hourvia_revoke_member_sessions(),
-  hourvia_revoke_organization_sessions(), hourvia_guard_audit_insert(), hourvia_require_member_invitation() FROM PUBLIC;
+  hourvia_revoke_organization_sessions(), hourvia_guard_audit_insert(), hourvia_require_member_invitation(),
+  hourvia_guard_invitation_update() FROM PUBLIC;
 DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'netlifydb_readonly') THEN
     REVOKE ALL ON organization_seat_entitlements FROM netlifydb_readonly;
     REVOKE ALL ON FUNCTION hourvia_guard_seat_entitlement(), hourvia_guard_session_insert(), hourvia_revoke_member_sessions(),
-      hourvia_revoke_organization_sessions(), hourvia_guard_audit_insert(), hourvia_require_member_invitation() FROM netlifydb_readonly;
+      hourvia_revoke_organization_sessions(), hourvia_guard_audit_insert(), hourvia_require_member_invitation(),
+      hourvia_guard_invitation_update() FROM netlifydb_readonly;
   END IF;
 END
 $$;
@@ -767,7 +829,8 @@ BEGIN
         'platform_super_admin_designation_audit', 'platform_super_admin_designation_no_truncate',
         'organizations_guard', 'organizations_no_truncate', 'organization_seat_entitlements_guard',
         'organization_seat_entitlements_no_truncate', 'auth_sessions_guard_insert', 'auth_audit_events_guard_insert',
-        'workspace_members_status_session_revocation', 'organizations_suspension_revocation', 'workspace_members_runtime_invitation')) <> 25 THEN
+        'workspace_members_status_session_revocation', 'organizations_suspension_revocation', 'workspace_members_runtime_invitation',
+        'workspace_invitations_guard_update')) <> 26 THEN
     RAISE EXCEPTION 'self-check failed: guard or audit triggers are missing or disabled';
   END IF;
   -- Sprint 3.0.2 (G1): the member revocation trigger fires on transitions into and out of both 'suspended' and 'disabled'.
@@ -822,14 +885,93 @@ BEGIN
                  AND tgrelid = 'public.workspace_members'::regclass) THEN
     RAISE EXCEPTION 'self-check failed: the runtime invitation constraint trigger is not deferred';
   END IF;
+  -- Sprint 3.0.5 (M-1a): organization suspension revocation is pinned like the member one. Exactly one trigger calls
+  -- it: AFTER UPDATE OF status, FOR EACH ROW (tgtype 17), enabled, with the exact active -> non-active WHEN clause. The
+  -- function must require READ COMMITTED, take the EXCLUSIVE per-organization session lock (never shared or try-lock)
+  -- before its single UPDATE, and revoke every still-unrevoked session of that organization.
+  IF (SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal AND tgfoid = 'public.hourvia_revoke_organization_sessions()'::regprocedure) <> 1
+     OR NOT EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgname = 'organizations_suspension_revocation' AND t.tgrelid = 'public.organizations'::regclass
+       AND NOT t.tgisinternal AND t.tgenabled = 'O' AND t.tgtype = 17
+       AND t.tgfoid = 'public.hourvia_revoke_organization_sessions()'::regprocedure
+       AND t.tgattr::text = (SELECT a.attnum::text FROM pg_attribute a WHERE a.attrelid = 'public.organizations'::regclass AND a.attname = 'status')
+       AND replace(pg_get_triggerdef(t.oid), 'EXECUTE FUNCTION public.hourvia_', 'EXECUTE FUNCTION hourvia_') = 'CREATE TRIGGER organizations_suspension_revocation AFTER UPDATE OF status ON public.organizations FOR EACH ROW WHEN (((old.status = ''active''::text) AND (new.status <> ''active''::text))) EXECUTE FUNCTION hourvia_revoke_organization_sessions()') THEN
+    RAISE EXCEPTION 'self-check failed: organization suspension revocation trigger is not in its reviewed form';
+  END IF;
+  DECLARE
+    body text := pg_get_functiondef('public.hourvia_revoke_organization_sessions()'::regprocedure);
+  BEGIN
+    IF body NOT LIKE '%IF current_setting(''transaction_isolation'') <> ''read committed'' THEN%RAISE EXCEPTION%END IF;%'
+       OR body NOT LIKE '%PERFORM pg_advisory_xact_lock(hashtextextended(''hourvia_sessions:'' || NEW.id::text, 0));%UPDATE auth_sessions SET revoked_at = now(), revoked_reason = ''organization_'' || NEW.status%WHERE organization_id = NEW.id AND revoked_at IS NULL;%'
+       OR body LIKE '%pg_advisory_xact_lock_shared%' OR body LIKE '%pg_try_advisory%'
+       OR (length(body) - length(replace(body, 'UPDATE auth_sessions', ''))) <> length('UPDATE auth_sessions')
+       OR strpos(body, 'UPDATE auth_sessions') < strpos(body, 'PERFORM pg_advisory_xact_lock(') THEN
+      RAISE EXCEPTION 'self-check failed: hourvia_revoke_organization_sessions does not revoke under the exclusive session lock';
+    END IF;
+  END;
+  -- Sprint 3.0.5 (M-1b): the session insert guard takes the SHARED per-organization session lock (never exclusive or
+  -- try-lock) and only then reads member and organization status, exactly once, in a statement that starts after the
+  -- lock is granted (READ COMMITTED: a fresh snapshot). Nothing returns before that check.
+  DECLARE
+    body text := pg_get_functiondef('public.hourvia_guard_session_insert()'::regprocedure);
+  BEGIN
+    IF body NOT LIKE '%IF current_setting(''transaction_isolation'') <> ''read committed'' THEN%RAISE EXCEPTION%END IF;%'
+       OR body NOT LIKE '%PERFORM pg_advisory_xact_lock_shared(hashtextextended(''hourvia_sessions:'' || NEW.organization_id::text, 0));%IF NOT EXISTS (SELECT 1 FROM workspace_members m JOIN organizations o ON o.id = m.organization_id%WHERE m.id = NEW.member_id AND m.organization_id = NEW.organization_id AND m.status = ''active''%AND m.auth_user_id IS NOT NULL AND o.status = ''active'') THEN%RAISE EXCEPTION ''sessions can be created only for an active member of an active organization'';%END IF;%RETURN NEW;%'
+       OR body LIKE '%pg_advisory_xact_lock(%' OR body LIKE '%pg_try_advisory%'
+       OR (length(body) - length(replace(body, 'FROM workspace_members', ''))) <> length('FROM workspace_members')
+       OR (length(body) - length(replace(body, 'RETURN NEW;', ''))) <> length('RETURN NEW;') OR body LIKE '%RETURN NULL%'
+       OR strpos(body, 'FROM workspace_members') < strpos(body, 'PERFORM pg_advisory_xact_lock_shared(') THEN
+      RAISE EXCEPTION 'self-check failed: hourvia_guard_session_insert does not re-check status under the shared session lock';
+    END IF;
+  END;
+  -- Sprint 3.0.5 (M-2): the invitation state machine is installed and complete, and the runtime can update only
+  -- status and accepted_at on invitations.
+  IF (SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal AND tgfoid = 'public.hourvia_guard_invitation_update()'::regprocedure) <> 1
+     OR NOT EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgname = 'workspace_invitations_guard_update' AND t.tgrelid = 'public.workspace_invitations'::regclass
+       AND NOT t.tgisinternal AND t.tgenabled = 'O' AND t.tgtype = 19 AND t.tgattr::text = ''
+       AND t.tgqual IS NULL AND t.tgfoid = 'public.hourvia_guard_invitation_update()'::regprocedure) THEN
+    RAISE EXCEPTION 'self-check failed: the invitation update guard trigger is not in its reviewed form';
+  END IF;
+  DECLARE
+    body text := pg_get_functiondef('public.hourvia_guard_invitation_update()'::regprocedure);
+  BEGIN
+    IF body NOT LIKE '%IF NEW.id IS DISTINCT FROM OLD.id OR NEW.organization_id IS DISTINCT FROM OLD.organization_id%OR NEW.workspace_id IS DISTINCT FROM OLD.workspace_id OR NEW.member_id IS DISTINCT FROM OLD.member_id%OR NEW.email IS DISTINCT FROM OLD.email OR NEW.role IS DISTINCT FROM OLD.role%OR NEW.invited_by_member_id IS DISTINCT FROM OLD.invited_by_member_id%OR NEW.created_at IS DISTINCT FROM OLD.created_at OR NEW.expires_at IS DISTINCT FROM OLD.expires_at THEN%RAISE EXCEPTION ''workspace_invitations identity columns are immutable'';%'
+       OR body NOT LIKE '%IF NEW.status IS NOT DISTINCT FROM OLD.status THEN%IF NEW.accepted_at IS DISTINCT FROM OLD.accepted_at THEN%RAISE EXCEPTION ''invitation acceptance is final'';%'
+       OR body NOT LIKE '%IF OLD.status <> ''pending'' THEN%RAISE EXCEPTION ''accepted and revoked invitations are final'';%IF NEW.status = ''revoked'' THEN%RETURN NEW;%IF NEW.status IS DISTINCT FROM ''accepted'' THEN%RAISE EXCEPTION%'
+       OR body NOT LIKE '%IF NEW.accepted_at IS NULL OR NEW.accepted_at < OLD.created_at - interval ''2 minutes''%OR NEW.accepted_at > clock_timestamp() + interval ''2 minutes'' THEN%RAISE EXCEPTION%'
+       OR body NOT LIKE '%IF OLD.expires_at <= greatest(now(), NEW.accepted_at) THEN%RAISE EXCEPTION ''expired invitations cannot be accepted'';%'
+       OR body NOT LIKE '%WHERE m.id = OLD.member_id AND m.organization_id = OLD.organization_id AND m.workspace_id = OLD.workspace_id%AND m.status = ''invited'' AND m.role = OLD.role AND m.auth_user_id IS NOT NULL AND o.status = ''active'') THEN%RAISE EXCEPTION%'
+       OR (length(body) - length(replace(body, 'RETURN NEW', ''))) <> 3 * length('RETURN NEW') THEN
+      RAISE EXCEPTION 'self-check failed: hourvia_guard_invitation_update does not enforce the invitation state machine';
+    END IF;
+  END;
+  IF (SELECT array_agg(a.attname::text ORDER BY a.attname) FROM pg_attribute a
+      WHERE a.attrelid = 'public.workspace_invitations'::regclass AND a.attnum > 0 AND NOT a.attisdropped
+        AND has_column_privilege('hourvia_auth_runtime', a.attrelid, a.attnum, 'UPDATE')) IS DISTINCT FROM ARRAY['accepted_at', 'status'] THEN
+    RAISE EXCEPTION 'self-check failed: hourvia_auth_runtime can update unexpected workspace_invitations columns';
+  END IF;
+  -- Sprint 3.0.5 (L-4): both new indexes exist exactly as reviewed: valid, ready, live, non-unique btree, on the
+  -- reviewed columns in order, with the reviewed partial predicate and no expressions.
+  IF (SELECT count(*) FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid JOIN pg_am am ON am.oid = i.relam
+      WHERE i.relnamespace = 'public'::regnamespace AND am.amname = 'btree' AND x.indisvalid AND x.indisready AND x.indislive
+        AND NOT x.indisunique AND x.indexprs IS NULL
+        AND ((i.relname = 'workspace_members_auth_user' AND x.indrelid = 'public.workspace_members'::regclass
+              AND x.indkey::text = (SELECT a.attnum::text FROM pg_attribute a WHERE a.attrelid = 'public.workspace_members'::regclass AND a.attname = 'auth_user_id')
+              AND pg_get_expr(x.indpred, x.indrelid) = '(auth_user_id IS NOT NULL)')
+          OR (i.relname = 'workspace_invitations_organization_pending' AND x.indrelid = 'public.workspace_invitations'::regclass
+              AND x.indkey::text = (SELECT (SELECT a.attnum::text FROM pg_attribute a WHERE a.attrelid = 'public.workspace_invitations'::regclass AND a.attname = 'organization_id')
+                                           || ' ' || (SELECT a.attnum::text FROM pg_attribute a WHERE a.attrelid = 'public.workspace_invitations'::regclass AND a.attname = 'expires_at'))
+              AND pg_get_expr(x.indpred, x.indrelid) = '(status = ''pending''::text)'))) <> 2 THEN
+    RAISE EXCEPTION 'self-check failed: an M8 index is missing or not in its reviewed form';
+  END IF;
   -- 9d'. M1: platform authority never comes from a customer membership (behavioural check of the replaced body).
   IF pg_get_functiondef('public.hourvia_member_authority(uuid, text)'::regprocedure) NOT LIKE '%m.organization_id = ''5adff49b-11d5-4b45-bb4f-2f76cfcca0c6''::uuid%' THEN
     RAISE EXCEPTION 'self-check failed: hourvia_member_authority is not restricted to ThriveSource';
   END IF;
 
-  -- 9e. Functions: the 16 M7 functions plus the six M8 trigger functions (seat entitlement, session insert, member and
-  -- organization suspension revocation, audit insert, member invitation); pinned; SECURITY DEFINER and EXECUTE unchanged.
-  IF (SELECT count(*) FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace AND p.proname LIKE 'hourvia\_%') <> 22 THEN
+  -- 9e. Functions: the 16 M7 functions plus the seven M8 trigger functions (seat entitlement, session insert, member and
+  -- organization suspension revocation, audit insert, member invitation, invitation update); pinned; SECURITY DEFINER
+  -- and EXECUTE unchanged.
+  IF (SELECT count(*) FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace AND p.proname LIKE 'hourvia\_%') <> 23 THEN
     RAISE EXCEPTION 'self-check failed: unexpected number of hourvia_* functions';
   END IF;
   FOR r IN SELECT p.oid::regprocedure AS f, p.proconfig, p.prosecdef, p.proname, pg_get_userbyid(p.proowner) AS owner

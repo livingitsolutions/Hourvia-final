@@ -479,6 +479,7 @@ describe('production wiring stays single-organization', () => {
       .map(f => f.replace(/^(\.\.\/)+/, ''));
     expect(users.sort()).toEqual([
       'server/auth/disable-lock-order.rehearsal.test.ts', // Sprint 3.0.3, disposable PostgreSQL only
+      'server/auth/m8-invitation-and-lock-pins.test.ts', // Sprint 3.0.5, offline PGlite only
       'server/auth/multi-organization-hardening.test.ts', 'server/auth/multi-organization.rehearsal.test.ts', 'server/auth/multi-organization.test.ts',
       'src/domain/organization.ts', 'src/domain/tenancy.test.ts']);
   });
