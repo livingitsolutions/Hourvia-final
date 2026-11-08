@@ -967,6 +967,21 @@ BEGIN
               AND pg_get_expr(x.indpred, x.indrelid) = '(status = ''pending''::text)'))) <> 2 THEN
     RAISE EXCEPTION 'self-check failed: an M8 index is missing or not in its reviewed form';
   END IF;
+  -- PR #23 billing correction: every seat consumer judges billing expiry by the real clock (clock_timestamp(), when the
+  -- statement runs), never by the transaction-start now(). Each of the three guards must hold exactly one billing
+  -- comparison, in this form, and no billing_expires_at expression may involve now().
+  FOR r IN SELECT f FROM unnest(ARRAY['public.hourvia_guard_member_update()', 'public.hourvia_guard_member_insert()',
+                                      'public.hourvia_guard_invitation_insert()']::regprocedure[]) f LOOP
+    DECLARE
+      body text := pg_get_functiondef(r.f);
+    BEGIN
+      IF body NOT LIKE '%IF ent.billing_expires_at IS NOT NULL AND ent.billing_expires_at <= clock_timestamp() THEN%RAISE EXCEPTION ''organization seat entitlement has expired'';%'
+         OR body ~ 'billing_expires_at[^;]*now\(\)'
+         OR (length(body) - length(replace(body, 'billing_expires_at', ''))) <> 3 * length('billing_expires_at') THEN
+        RAISE EXCEPTION 'self-check failed: % does not judge billing expiry by the real clock', r.f;
+      END IF;
+    END;
+  END LOOP;
   -- 9d'. M1: platform authority never comes from a customer membership (behavioural check of the replaced body).
   IF pg_get_functiondef('public.hourvia_member_authority(uuid, text)'::regprocedure) NOT LIKE '%m.organization_id = ''5adff49b-11d5-4b45-bb4f-2f76cfcca0c6''::uuid%' THEN
     RAISE EXCEPTION 'self-check failed: hourvia_member_authority is not restricted to ThriveSource';

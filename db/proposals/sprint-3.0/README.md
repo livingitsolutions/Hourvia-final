@@ -47,7 +47,7 @@ These do not consume a seat:
 - suspended members;
 - disabled members.
 
-Organizations are counted independently. An organization with no entitlement row can't invite or activate anyone, so it fails closed. Re-sending an invitation replaces its own reservation.
+Billing expiry is judged by the real database clock (`clock_timestamp()`, when the statement runs), never the transaction-start `now()`, on every seat path: pending invitation, activation, reactivation and active insert (PR #23 correction; the self-check pins all three guards). Organizations are counted independently. An organization with no entitlement row can't invite or activate anyone, so it fails closed. Re-sending an invitation replaces its own reservation.
 
 **Lock protocol (3.0.1).** Two advisory locks, per organization:
 - `hourvia_seats:<org>`, exclusive, taken by every seat consumer. It serializes the count-then-insert, so concurrent consumers can't over-allocate.
@@ -104,7 +104,7 @@ Promotion therefore needs an **explicit, owner-approved release window**: a name
 
 ## Final proposal digest (Sprint 3.0.5)
 
-`20261106120000_multi-organization-memberships.sql` SHA-256: **`beaddd6a0c0198eefbd7c5b7f5b6f02d6c358cd8c646681fba764e4d6f6bbdc1`** (Sprint 3.0.5; supersedes `3c54e08d…8cfb` from Sprint 3.0.3). It is pinned in `server/auth/m8-invitation-and-lock-pins.test.ts`, so any edit fails the offline suite. The Netlify preview rehearsal ([runbook](../../../docs/m8-preview-rehearsal-runbook.md)) must use exactly this digest. Any edit to the file invalidates the review and any rehearsal evidence.
+`20261106120000_multi-organization-memberships.sql` SHA-256: **`f401b7a3af458749a6078037d67cd284aac1672f0653c4b0540031f9a4e0b532`** (Sprint 3.0.5; supersedes `3c54e08d…8cfb` from Sprint 3.0.3). It is pinned in `server/auth/m8-invitation-and-lock-pins.test.ts`, so any edit fails the offline suite. The Netlify preview rehearsal ([runbook](../../../docs/m8-preview-rehearsal-runbook.md)) must use exactly this digest. Any edit to the file invalidates the review and any rehearsal evidence.
 
 ## Rollback limitations
 

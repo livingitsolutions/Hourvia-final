@@ -29,7 +29,7 @@ const ctx = (org: OrganizationId, slug: string): OrganizationContext =>
 const one = async <T = Record<string, unknown>>(h: Harness, text: string, params?: unknown[]) => (await h.pg.query<T>(text, params)).rows[0]!;
 const SELF_CHECK_START = M8_PROPOSAL_SQL.indexOf('-- 9. Self-check');
 /** Final Sprint 3.0.5 proposal digest. The Netlify preview rehearsal must run exactly this file. */
-const M8_PROPOSAL_DIGEST = 'beaddd6a0c0198eefbd7c5b7f5b6f02d6c358cd8c646681fba764e4d6f6bbdc1';
+const M8_PROPOSAL_DIGEST = 'f401b7a3af458749a6078037d67cd284aac1672f0653c4b0540031f9a4e0b532';
 
 /** An M8 database with ACME (seats), an active ACME Administrator, and an invited, linked contractor with a pending invitation. */
 async function acme(seats = 5, invitation: { createdAgoMs?: number; expiresInMs?: number } = {}) {
@@ -58,6 +58,100 @@ async function acme(seats = 5, invitation: { createdAgoMs?: number; expiresInMs?
          WHERE i.organization_id = $1 AND i.status = 'pending' AND i.expires_at > now() AND m.status = 'invited'))::int AS n`, [ACME])).n;
   return { h, admin, casey, inv, store, runtime, owner, status, consumed, addMember, invite };
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// PR #23 billing correction: the three seat guards judge billing_expires_at by clock_timestamp(), not the
+// transaction-start now(). Real-PostgreSQL evidence with separate backends is S14 in multi-organization.rehearsal.test.ts.
+describe('PR #23: billing expiry is judged by the real clock on every seat path', () => {
+  const billing = (t: Awaited<ReturnType<typeof acme>>, at: string) =>
+    t.owner(`UPDATE organization_seat_entitlements SET billing_expires_at = ${at} WHERE organization_id = $1`, [ACME]);
+  /** Runs `late` in a transaction opened while billing is valid, after sleeping past its real expiry. */
+  const straddle = (t: Awaited<ReturnType<typeof acme>>, role: 'runtime' | 'operator', late: [string, unknown[]][]) =>
+    t.h.pg.transaction(async tx => {
+      if (role === 'runtime') await tx.query('SET LOCAL ROLE hourvia_auth_runtime');
+      const before = (await tx.query<{ ok: boolean }>(`SELECT now() < billing_expires_at AS ok FROM organization_seat_entitlements WHERE organization_id = $1`, [ACME])).rows[0]!;
+      expect(before.ok).toBe(true); // opened while billing was valid
+      await tx.query(`SELECT pg_sleep(2)`);
+      const after = (await tx.query<{ expired: boolean; stale: boolean }>(`SELECT clock_timestamp() >= billing_expires_at AS expired, now() < billing_expires_at AS stale
+        FROM organization_seat_entitlements WHERE organization_id = $1`, [ACME])).rows[0]!;
+      expect(after).toEqual({ expired: true, stale: true }); // really expired, while now() still says valid
+      for (const [sql, params] of late) await tx.query(sql, params);
+    });
+  const EXPIRED = /organization seat entitlement has expired/;
+
+  it('an already expired entitlement refuses every seat consumer; a valid one allows them', async () => {
+    const t = await acme();
+    const dana = await t.addMember('dana@acme.test', 'contractor', 'invited');
+    await billing(t, `now() - interval '1 minute'`);
+    await expect(t.runtime(`INSERT INTO workspace_invitations (organization_id, workspace_id, member_id, email, role, status, invited_by_member_id, created_at, expires_at)
+      VALUES ($1, 'acme', $2, 'dana@acme.test', 'contractor', 'pending', $3, now(), now() + interval '1 day')`, [ACME, dana, t.admin])).rejects.toThrow(EXPIRED);
+    await expect(t.store.acceptInvitation(t.casey, new Date())).rejects.toThrow(EXPIRED);
+    expect(await t.status()).toBe('pending'); // the acceptance rolled back with the refused activation
+    await billing(t, `now() + interval '30 days'`);
+    await t.runtime(`INSERT INTO workspace_invitations (organization_id, workspace_id, member_id, email, role, status, invited_by_member_id, created_at, expires_at)
+      VALUES ($1, 'acme', $2, 'dana@acme.test', 'contractor', 'pending', $3, now(), now() + interval '1 day')`, [ACME, dana, t.admin]);
+    expect(await t.store.acceptInvitation(t.casey, new Date())).toBe(true);
+  });
+
+  it('a transaction opened before billing expiry cannot reserve or consume a seat after it', async () => {
+    const t = await acme();
+    const dana = await t.addMember('dana@acme.test', 'contractor', 'invited');
+    const sus = await t.addMember('sus@acme.test', 'contractor', 'active');
+    await t.owner(`UPDATE workspace_members SET status = 'suspended' WHERE id = $1`, [sus]);
+    const cases: [string, 'runtime' | 'operator', [string, unknown[]][]][] = [
+      ['runtime pending invitation', 'runtime', [[`INSERT INTO workspace_invitations (organization_id, workspace_id, member_id, email, role, status, invited_by_member_id, created_at, expires_at)
+        VALUES ($1, 'acme', $2, 'dana@acme.test', 'contractor', 'pending', $3, now(), now() + interval '1 day')`, [ACME, dana, t.admin]]]],
+      ['runtime activation after acceptance', 'runtime', [
+        [`UPDATE workspace_invitations SET status = 'accepted', accepted_at = now() WHERE id = $1 AND status = 'pending'`, [t.inv]],
+        [`UPDATE workspace_members SET status = 'active', activated_at = now() WHERE id = $1 AND organization_id = $2 AND status = 'invited'`, [t.casey, ACME]]]],
+      ['operator reactivation', 'operator', [[`UPDATE workspace_members SET status = 'active' WHERE id = $2 AND organization_id = $1`, [ACME, sus]]]],
+      ['operator active insert', 'operator', [[`INSERT INTO workspace_members (organization_id, workspace_id, auth_user_id, email, display_name, role, status, activated_at)
+        VALUES ($1, 'acme', gen_random_uuid(), 'late@acme.test', 'r', 'contractor', 'active', now())`, [ACME]]]],
+    ];
+    for (const [name, role, late] of cases) {
+      await billing(t, `clock_timestamp() + interval '1500 milliseconds'`);
+      await expect(straddle(t, role, late), name).rejects.toThrow(EXPIRED);
+    }
+    expect(await t.status()).toBe('pending');
+    expect((await one<{ s: string }>(t.h, `SELECT status s FROM workspace_members WHERE id = $1`, [sus])).s).toBe('suspended');
+    expect(await t.consumed()).toBe(2); // admin + casey's reservation: nothing was consumed after expiry
+  });
+
+  it('control: the same long transaction still consumes a seat while billing is valid by the real clock', async () => {
+    const t = await acme();
+    const dana = await t.addMember('dana@acme.test', 'contractor', 'invited');
+    await billing(t, `clock_timestamp() + interval '1 hour'`);
+    await t.h.pg.transaction(async tx => {
+      await tx.query('SET LOCAL ROLE hourvia_auth_runtime');
+      await tx.query(`SELECT pg_sleep(1)`);
+      await tx.query(`INSERT INTO workspace_invitations (organization_id, workspace_id, member_id, email, role, status, invited_by_member_id, created_at, expires_at)
+        VALUES ($1, 'acme', $2, 'dana@acme.test', 'contractor', 'pending', $3, now(), now() + interval '1 day')`, [ACME, dana, t.admin]);
+    });
+    expect(await t.consumed()).toBe(3);
+  });
+
+  // Self-check: reverting any one of the three billing comparisons (or adding a now()-based one) aborts M8.
+  const BILLING_FN = /self-check failed: hourvia_guard_(member_update|member_insert|invitation_insert)\(\) does not judge billing expiry by the real clock/;
+  const BILLING = 'ent.billing_expires_at IS NOT NULL AND ent.billing_expires_at <= clock_timestamp() THEN';
+  const nth = (text: string, needle: string, n: number) => { let at = -1; for (let i = 0; i <= n; i++) at = text.indexOf(needle, at + 1); return at; };
+  for (const [n, fn] of ['hourvia_guard_member_update', 'hourvia_guard_member_insert', 'hourvia_guard_invitation_insert'].entries()) {
+    for (const [label, to] of [
+      ['reverts to now()', 'ent.billing_expires_at IS NOT NULL AND ent.billing_expires_at <= now() THEN'],
+      ['adds a now()-based billing escape', 'ent.billing_expires_at IS NOT NULL AND ent.billing_expires_at <= clock_timestamp() AND ent.billing_expires_at <= now() THEN'],
+      ['drops the billing check', 'false THEN'],
+    ] as const) {
+      it(`self-check: ${fn} ${label}`, async () => {
+        const at = nth(M8_PROPOSAL_SQL, BILLING, n);
+        expect(at).toBeGreaterThan(M8_PROPOSAL_SQL.indexOf(`FUNCTION ${fn}()`));
+        expect(at).toBeLessThan(SELF_CHECK_START);
+        const mutated = M8_PROPOSAL_SQL.slice(0, at) + to + M8_PROPOSAL_SQL.slice(at + BILLING.length);
+        const h = await createHarness({ now: new Date() }); // M1-M7
+        await expect(applyMigration(h.pg, mutated)).rejects.toThrow(label === 'drops the billing check' ? /self-check failed: hourvia_guard_\w+\(\) does not judge billing expiry by the real clock/ : BILLING_FN);
+        expect((await one<{ n: number }>(h, `SELECT count(*)::int n FROM pg_proc WHERE proname LIKE 'hourvia\\_%'`)).n).toBe(16); // rolled back
+      });
+    }
+  }
+});
 
 // ---------------------------------------------------------------------------------------------------------------------
 describe('M-2: the invitation state machine holds for the runtime and for operator SQL', () => {

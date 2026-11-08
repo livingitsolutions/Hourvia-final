@@ -5,7 +5,7 @@
 | Item | Value |
 |---|---|
 | Proposal file | `db/proposals/sprint-3.0/20261106120000_multi-organization-memberships.sql` |
-| **Pinned final digest** | `beaddd6a0c0198eefbd7c5b7f5b6f02d6c358cd8c646681fba764e4d6f6bbdc1` |
+| **Pinned final digest** | `f401b7a3af458749a6078037d67cd284aac1672f0653c4b0540031f9a4e0b532` |
 | Baseline | `main` with M1–M7 exactly (digests in `docs/operations-status.md`) |
 | Verification script | `db/verification/sprint-3.0.5-m8-preview-readonly.sql` (read-only, catalog-only, one SELECT) |
 | Site | `hourvia-tracker` (`48d7a24b-6072-40bc-866f-0d6e43a921ea`) |
