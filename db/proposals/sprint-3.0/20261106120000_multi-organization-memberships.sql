@@ -445,7 +445,8 @@ $$;
 -- 5a. Sprint 3.0.5 (M-2): invitation state machine. Before M8 only INSERT was guarded, and the runtime holds
 -- UPDATE (status, accepted_at), so a revoked or accepted invitation could be put back to 'pending' (re-reserving a
 -- seat without the insert guard's seat, organization and inviter checks) or accepted after expiry. For every role:
---   * pending -> accepted: once, unexpired by the database clock AND at the claimed acceptance time, accepted_at between
+--   * pending -> accepted: once, unexpired by the real database clock (clock_timestamp(), not the transaction start)
+--     AND at the claimed acceptance time, accepted_at between
 --     creation and database time (2 minutes of application/database clock-skew tolerance on both sides; a back-dated
 --     accepted_at can never revive an expired invitation, because expiry is judged at the later of the two times),
 --     for the invited, linked member of an active organization (same role);
@@ -455,6 +456,8 @@ $$;
 -- and the activation that follows is re-counted by hourvia_guard_member_update under the seat lock. Two concurrent
 -- acceptances serialize on the row lock; under READ COMMITTED the loser re-reads the accepted row and is refused here
 -- (or matches no row when it filters on status = 'pending').
+-- PR #23 correction: every time comparison here uses clock_timestamp() (the real time when the statement runs), never
+-- now() (fixed at transaction start), so a transaction opened before expiry cannot accept the invitation after it.
 CREATE FUNCTION hourvia_guard_invitation_update() RETURNS trigger
 LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$
 BEGIN
@@ -484,7 +487,7 @@ BEGIN
      OR NEW.accepted_at > clock_timestamp() + interval '2 minutes' THEN
     RAISE EXCEPTION 'invitation accepted_at must lie between its creation and the database clock';
   END IF;
-  IF OLD.expires_at <= greatest(now(), NEW.accepted_at) THEN
+  IF OLD.expires_at <= greatest(clock_timestamp(), NEW.accepted_at) THEN
     RAISE EXCEPTION 'expired invitations cannot be accepted';
   END IF;
   IF NOT EXISTS (SELECT 1 FROM workspace_members m JOIN organizations o ON o.id = m.organization_id
@@ -938,7 +941,8 @@ BEGIN
        OR body NOT LIKE '%IF NEW.status IS NOT DISTINCT FROM OLD.status THEN%IF NEW.accepted_at IS DISTINCT FROM OLD.accepted_at THEN%RAISE EXCEPTION ''invitation acceptance is final'';%'
        OR body NOT LIKE '%IF OLD.status <> ''pending'' THEN%RAISE EXCEPTION ''accepted and revoked invitations are final'';%IF NEW.status = ''revoked'' THEN%RETURN NEW;%IF NEW.status IS DISTINCT FROM ''accepted'' THEN%RAISE EXCEPTION%'
        OR body NOT LIKE '%IF NEW.accepted_at IS NULL OR NEW.accepted_at < OLD.created_at - interval ''2 minutes''%OR NEW.accepted_at > clock_timestamp() + interval ''2 minutes'' THEN%RAISE EXCEPTION%'
-       OR body NOT LIKE '%IF OLD.expires_at <= greatest(now(), NEW.accepted_at) THEN%RAISE EXCEPTION ''expired invitations cannot be accepted'';%'
+       OR body NOT LIKE '%IF OLD.expires_at <= greatest(clock_timestamp(), NEW.accepted_at) THEN%RAISE EXCEPTION ''expired invitations cannot be accepted'';%'
+       OR strpos(body, 'now()') > 0
        OR body NOT LIKE '%WHERE m.id = OLD.member_id AND m.organization_id = OLD.organization_id AND m.workspace_id = OLD.workspace_id%AND m.status = ''invited'' AND m.role = OLD.role AND m.auth_user_id IS NOT NULL AND o.status = ''active'') THEN%RAISE EXCEPTION%'
        OR (length(body) - length(replace(body, 'RETURN NEW', ''))) <> 3 * length('RETURN NEW') THEN
       RAISE EXCEPTION 'self-check failed: hourvia_guard_invitation_update does not enforce the invitation state machine';

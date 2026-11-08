@@ -29,7 +29,7 @@ const ctx = (org: OrganizationId, slug: string): OrganizationContext =>
 const one = async <T = Record<string, unknown>>(h: Harness, text: string, params?: unknown[]) => (await h.pg.query<T>(text, params)).rows[0]!;
 const SELF_CHECK_START = M8_PROPOSAL_SQL.indexOf('-- 9. Self-check');
 /** Final Sprint 3.0.5 proposal digest. The Netlify preview rehearsal must run exactly this file. */
-const M8_PROPOSAL_DIGEST = 'fd7dca8e4f266c883f852ba137cf0a50523dcddb82672cb54a2ec02079548909';
+const M8_PROPOSAL_DIGEST = 'dc5640f445eba246eed207f18f412bc7f07c80d0066c3bdfba722ace40ba1850';
 
 /** An M8 database with ACME (seats), an active ACME Administrator, and an invited, linked contractor with a pending invitation. */
 async function acme(seats = 5, invitation: { createdAgoMs?: number; expiresInMs?: number } = {}) {
@@ -101,6 +101,29 @@ describe('M-2: the invitation state machine holds for the runtime and for operat
     }
     // A true no-op is allowed.
     expect((await t.runtime(`UPDATE workspace_invitations SET status = status WHERE id = $1 RETURNING id`, [t.inv])).rows).toHaveLength(1);
+  });
+
+  it('PR #23: a transaction opened BEFORE expiry cannot accept AFTER expiry (now() is the transaction start)', async () => {
+    const t = await acme(5, { expiresInMs: 1500 }); // expires 1.5 s after creation
+    const attempt = (claimed: string) => t.h.pg.transaction(async tx => {
+      await tx.query('SET LOCAL ROLE hourvia_auth_runtime');
+      const before = (await tx.query<{ ok: boolean }>(`SELECT now() < expires_at AS ok FROM workspace_invitations WHERE id = $1`, [t.inv])).rows[0]!;
+      expect(before.ok).toBe(true); // the transaction started while the invitation was valid
+      await tx.query(`SELECT pg_sleep(2)`);
+      const after = (await tx.query<{ ok: boolean; stale: boolean }>(`SELECT clock_timestamp() > expires_at AS ok, now() < expires_at AS stale FROM workspace_invitations WHERE id = $1`, [t.inv])).rows[0]!;
+      expect(after).toEqual({ ok: true, stale: true }); // really expired, but now() still says valid
+      await tx.query(`UPDATE workspace_invitations SET status = 'accepted', accepted_at = ${claimed} WHERE id = $1 AND status = 'pending'`, [t.inv]);
+    });
+    await expect(attempt('now()')).rejects.toThrow(/expired invitations cannot be accepted/);
+    expect(await t.status()).toBe('pending');
+    // Control: the same long-transaction shape still accepts a valid invitation.
+    const ok = await acme(5, { expiresInMs: 60_000 });
+    await ok.h.pg.transaction(async tx => {
+      await tx.query('SET LOCAL ROLE hourvia_auth_runtime');
+      await tx.query(`SELECT pg_sleep(1)`);
+      await tx.query(`UPDATE workspace_invitations SET status = 'accepted', accepted_at = now() WHERE id = $1 AND status = 'pending'`, [ok.inv]);
+    });
+    expect(await ok.status()).toBe('accepted');
   });
 
   it('an expired invitation cannot be accepted, even with a back-dated accepted_at or a stale application clock', async () => {
@@ -198,7 +221,9 @@ describe('Sprint 3.0.5: M8 self-checks reject any weakened lock, status, invitat
     ['C: invitation guard fires only on status updates', `BEFORE UPDATE ON workspace_invitations\n  FOR EACH ROW EXECUTE`, `BEFORE UPDATE OF status ON workspace_invitations\n  FOR EACH ROW EXECUTE`, INV],
     ['C: invitation guard has a WHEN escape', `BEFORE UPDATE ON workspace_invitations\n  FOR EACH ROW EXECUTE`, `BEFORE UPDATE ON workspace_invitations\n  FOR EACH ROW WHEN (current_user <> 'hourvia_auth_runtime') EXECUTE`, INV],
     ['C: revoked -> pending allowed', `IF OLD.status <> 'pending' THEN\n    RAISE EXCEPTION 'accepted and revoked`, `IF OLD.status = 'accepted' THEN\n    RAISE EXCEPTION 'accepted and revoked`, INV],
-    ['C: expiry judged only at the claimed time', `IF OLD.expires_at <= greatest(now(), NEW.accepted_at) THEN`, `IF OLD.expires_at <= NEW.accepted_at THEN`, INV],
+    ['C: expiry judged only at the claimed time', `IF OLD.expires_at <= greatest(clock_timestamp(), NEW.accepted_at) THEN`, `IF OLD.expires_at <= NEW.accepted_at THEN`, INV],
+    ['C: expiry judged at transaction start (now()) instead of the real clock', `IF OLD.expires_at <= greatest(clock_timestamp(), NEW.accepted_at) THEN`, `IF OLD.expires_at <= greatest(now(), NEW.accepted_at) THEN`, INV],
+    ['C: an extra now()-based expiry escape', `  IF NEW.status IS DISTINCT FROM 'accepted' THEN`, `  IF NEW.status = 'accepted' AND OLD.expires_at > now() AND false THEN\n    RAISE EXCEPTION 'x';\n  END IF;\n  IF NEW.status IS DISTINCT FROM 'accepted' THEN`, INV],
     ['C: accepted_at may predate creation by any amount', `OR NEW.accepted_at < OLD.created_at - interval '2 minutes'\n`, `OR NEW.accepted_at < OLD.created_at - interval '2 years'\n`, INV],
     ['C: accepted_at may lie in the future', `NEW.accepted_at > clock_timestamp() + interval '2 minutes' THEN`, `NEW.accepted_at > clock_timestamp() + interval '2 days' THEN`, INV],
     ['C: expires_at becomes mutable', `OR NEW.created_at IS DISTINCT FROM OLD.created_at OR NEW.expires_at IS DISTINCT FROM OLD.expires_at THEN\n    RAISE EXCEPTION 'workspace_invitations identity`,
