@@ -1,6 +1,6 @@
 # Hourvia operations status
 
-Last reconciled: Sprint 3.0.1, 2026-11-06. This document records what is known about the production deployment, database and configuration, and how each fact is known. It authorizes no operation. Update it whenever a status changes, and keep the evidence class accurate.
+Last reconciled: Sprint 3.0.2, 2026-11-07. This document records what is known about the production deployment, database and configuration, and how each fact is known. It authorizes no operation. Update it whenever a status changes, and keep the evidence class accurate.
 
 ## Evidence classes
 
@@ -19,12 +19,12 @@ Last reconciled: Sprint 3.0.1, 2026-11-06. This document records what is known a
 | Site | `hourvia-tracker` (`48d7a24b-6072-40bc-866f-0d6e43a921ea`) |
 | Canonical URL | https://hourvia.livingitsolutions.com (200) |
 | Production branch | `main`. Production publishing is **locked** on the published deploy below (verified 2026-11-06): a merge to `main` still builds a production deploy, but it is not published until the owner publishes it manually |
-| Published deploy | `6aebf26c137be0d868ccff2e`, commit `3fd11656743b799b8527dead246468e4cda20203` (PR #19, Sprint 3.0), context `production`, database branch `production`, published 2026-11-05 03:05:42 UTC, locked (re-verified 2026-11-06, Sprint 3.0.1) |
+| Published deploy | `6aebf26c137be0d868ccff2e`, commit `3fd11656743b799b8527dead246468e4cda20203` (PR #19, Sprint 3.0), context `production`, database branch `production`, published 2026-11-05 03:05:42 UTC, locked (re-verified 2026-11-07 from live site metadata, Sprint 3.0.2) |
 | Previous published deploy | `6aebe50abd9ac16c02942a31`, commit `6c22106d4e97eff0860c77b9f14b468e25209f67` (Historical) |
 | GitHub `main` protection | Ruleset `26699501` "Hourvia - Protect Main Production", enforcement `active`, target default branch: pull request with 1 approval (last-push approval, stale reviews dismissed, threads resolved), no deletion, no force push (verified 2026-11-06 through the public API). Bypass actors: **Unverified** (visible to admins only) |
 | Known-good rollback deploy | `6aeb5cd4c8797713f23cc5b8` (same commit) |
 | Authentication | Fail-closed. `/api/auth/session`, `/api/admin/members` and `/api/platform/overview` return 503 `auth_unavailable` (re-verified 2026-11-06) |
-| Multi-organization | Not available. No HTTP route; no runtime capability; M8 is a proposal outside the migrations directory |
+| Multi-organization | Not available. No HTTP route; no runtime capability; M8 is a proposal outside the migrations directory (re-verified 2026-11-07: `netlify/database/migrations/` holds exactly M1–M7, digests below unchanged) |
 | Deploy secret scan | 94 files scanned, 0 matches |
 
 ## Migrations (verified in the repository)

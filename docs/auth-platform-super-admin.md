@@ -67,7 +67,7 @@ Each procedure is owner SQL that needs its own written approval. Each one locks,
 | --- | --- | --- |
 | `grant-platform-super-admin.sql` | AP-PSA-GRANT | Locks the Living IT Solutions membership row (`SELECT … FOR UPDATE`), then verifies that the UID **and** the member ID match it, that it is `active` and activated, and that its role is `workspace_admin` (Administrator). A Manager or Contractor membership is refused and nothing is written. Writes the designation on the first run. Inserts the grant. A re-run while the grant is active writes nothing. After a revocation, a new run with a new approval reinstates it. |
 | `revoke-platform-super-admin.sql` | AP-PSA-REVOKE | Revokes the active grant, with a reason. Optionally ends every session of that identity, audited as `operator`. Doesn't change the membership. Re-running it is a no-op. |
-| `reinstate-disabled-member.sql` | AP-MEMBER-REINSTATE | Restores a member who was disabled in error to `active`, with the **same** role. Unban the Supabase user first, under the same approval. Doesn't restore ended sessions and doesn't grant any privilege. |
+| `reinstate-disabled-member.sql` | AP-MEMBER-REINSTATE | Restores a member who was disabled in error to `active`, with the **same** role. Unban the Supabase user first, under the same approval. Doesn't restore ended sessions and doesn't grant any privilege. Since Sprint 3.0.2 it first revokes any session of the member that is still unrevoked (reason `member_reinstated`, counted in the audit row as `stale_sessions_revoked`), so reinstatement can never revive an old session. |
 
 Changing the designated UID, for example if the Supabase identity is permanently lost, deliberately needs a reviewed forward migration. Membership identity is also immutable, so a new identity for the same mailbox needs a reviewed procedure in any case.
 
@@ -190,7 +190,7 @@ No migration, role, grant, credential or environment variable changed. Authoriza
 As before, `SET LOCAL ROLE` reverts at `COMMIT` or `ROLLBACK`. Tests on one reused physical connection show it never carries over to the next checkout.
 
 **Lock order for membership writes** (`server/auth/store-postgres.ts`)
-- **The order.** The `workspace_members` row is locked first, then its invitations. This holds for `upsertInvitation`, `disableMember` (whose status change and invitation revocation are one transaction) and `acceptInvitation`.
+- **The order.** The `workspace_members` row is locked first, then its invitations. This holds for `upsertInvitation`, `disableMember` (whose status change, session revocation and invitation revocation are one transaction since Sprint 3.0.2: member row lock, sessions, member status, invitations) and `acceptInvitation`.
 - **The change.** `acceptInvitation` now starts with `SELECT … FOR NO KEY UPDATE` on the member row. That is the same lock its activation `UPDATE` already took, so foreign-key inserts that reference the member are not blocked.
 - **Effect.** A concurrent accept and disable on the same member now serialize instead of deadlocking.
 - **Outcomes.**

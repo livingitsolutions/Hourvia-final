@@ -177,13 +177,37 @@ export class PostgresAuthStore implements AuthStore {
   }
 
   /** Sprint 1.9C: one transaction, so a disabled member can never be left with a pending invitation. */
-  disableMember(memberId: string, disabledBy: string, now: Date) {
+  async disableMember(memberId: string, disabledBy: string, now: Date) {
+    return (await this.disableMemberAndRevokeSessions(memberId, disabledBy, now)).changed;
+  }
+
+  /**
+   * Sprint 3.0.2 (G1): disabling a member and ending its sessions are ONE transaction. Before, they were two, so a
+   * failure between them left a disabled member with live session rows, which an operator reinstatement would bring
+   * back into force. Order (Sprint 1.9C.1 lock order: the member row first):
+   *   1. lock the member row FOR NO KEY UPDATE (the lock the status UPDATE takes anyway);
+   *   2. revoke every unrevoked session, attributed to the disabling administrator, even if the member is already
+   *      disabled, so leftovers from an earlier non-atomic disable are swept too;
+   *   3. disable the member (on an M8 database its trigger also revokes, under the exclusive per-organization session
+   *      lock, any session committed concurrently since step 2);
+   *   4. revoke pending invitations.
+   * Any failure rolls back all four, leaving the member and its sessions exactly as they were.
+   */
+  disableMemberAndRevokeSessions(memberId: string, disabledBy: string, now: Date): Promise<{ changed: boolean; sessionsRevoked: number }> {
     return this.sql.transaction(async tx => {
+      const locked = await tx.query<{ id: string; status: string }>(
+        `SELECT id, status FROM workspace_members WHERE workspace_id = $1 AND organization_id = $3 AND id = $2 AND id <> $4 FOR NO KEY UPDATE`, [this.ws, memberId, this.org, disabledBy]);
+      if (locked.rows.length !== 1) return { changed: false, sessionsRevoked: 0 };
+      const revoked = await tx.query(
+        `UPDATE auth_sessions SET revoked_at = $2, revoked_reason = 'member_disabled', revoked_by_member_id = $3
+         WHERE member_id = $1 AND organization_id = $4 AND revoked_at IS NULL RETURNING id`, [memberId, now, disabledBy, this.org]);
+      if (locked.rows[0]!.status === 'disabled') return { changed: false, sessionsRevoked: revoked.rows.length };
       const { rows } = await tx.query(
         `UPDATE workspace_members SET status = 'disabled', disabled_at = $3, disabled_by = $4
          WHERE workspace_id = $1 AND organization_id = $5 AND id = $2 AND status <> 'disabled' AND id <> $4 RETURNING id`, [this.ws, memberId, now, disabledBy, this.org]);
-      if (rows.length) await tx.query(`UPDATE workspace_invitations SET status = 'revoked' WHERE workspace_id = $1 AND organization_id = $3 AND member_id = $2 AND status = 'pending'`, [this.ws, memberId, this.org]);
-      return rows.length === 1;
+      if (rows.length !== 1) throw new Error('member_not_disableable');
+      await tx.query(`UPDATE workspace_invitations SET status = 'revoked' WHERE workspace_id = $1 AND organization_id = $3 AND member_id = $2 AND status = 'pending'`, [this.ws, memberId, this.org]);
+      return { changed: true, sessionsRevoked: revoked.rows.length };
     });
   }
 
