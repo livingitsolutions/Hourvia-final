@@ -211,7 +211,7 @@ RLS gives no protection: there are no policies, and this role bypasses RLS anywa
   Verify with `diff`.
 - [ ] **P3.** No code changes in the same PR. With the context gate, the preview's auth function stays 503, so the preview only validates the migration.
 - [ ] **P4.** Open the PR. On its Deploy Preview, confirm the deploy log shows both migrations applied with no error. A failure fails the preview; if so, fix forward with a new file.
-- [ ] **P5.** On the **preview** branch (Netlify dashboard, Database, or `netlify db connect` with that branch), run read-only checks:
+- [ ] **P5.** On the **preview** branch (Netlify dashboard, Database, or `netlify db connect` with that branch), run read-only checks. (Sprint 3.0.6: `netlify db connect` has no branch option and ignores the Git branch. See section 7 of the [M8 preview rehearsal runbook](m8-preview-rehearsal-runbook.md) for the only verified way to target a preview branch.)
   - all six tables exist
   - `select tgname from pg_trigger where not tgisinternal` returns the 3 triggers
   - `select rolname, rolbypassrls, rolcanlogin from pg_roles where rolname='hourvia_auth_runtime'` returns `false`, `false`
