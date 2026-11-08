@@ -686,4 +686,67 @@ describe.skipIf(!enabled)('Sprint 3.0.1 M8 concurrency rehearsal on a disposable
       expect((await statusOf(z.id))!.i).toBe('accepted');
     });
   }, 120_000);
+  // ---- Sprint 3.0.5 (PR #23 billing correction): billing expiry is judged by the real clock -----------------------------
+  it('S14. a transaction opened before billing expiry cannot reserve or consume a seat after it (all four seat paths)', async () => {
+    await withScenario('s14', 20, async s => {
+      const a = await s.seed(ACME, 'acme', 'owner@acme.test', 'workspace_admin');
+      const billingIn = (seconds: number) => s.op.query(`UPDATE organization_seat_entitlements SET billing_expires_at = now() + $2 * interval '1 second' WHERE organization_id = $1`, [ACME, seconds]);
+      /** Opens a transaction while billing is valid, sleeps past expiry (by the real clock), then runs `late`. */
+      const straddle = async (user: 'runtime' | 'operator', late: (c: PgClient) => Promise<unknown>, seconds = 2) => {
+        await billingIn(seconds);
+        const c = client(s.db);
+        await c.connect();
+        try {
+          await c.query('BEGIN');
+          if (user === 'runtime') await c.query('SET LOCAL ROLE hourvia_auth_runtime');
+          expect((await c.query<{ ok: boolean }>(`SELECT now() < $1::timestamptz AS ok`, [(await s.mon.query(`SELECT billing_expires_at b FROM organization_seat_entitlements WHERE organization_id = $1`, [ACME])).rows[0].b])).rows[0]!.ok).toBe(true);
+          await c.query(`SELECT pg_sleep(${seconds + 1})`);
+          const r = await settle(late(c));
+          await c.query(r.ok ? 'COMMIT' : 'ROLLBACK');
+          return r;
+        } finally { await c.end(); }
+      };
+      const results: Record<string, string> = {};
+      const expectExpired = (name: string, r: { ok: boolean; e?: string }) => {
+        results[name] = r.ok ? 'ALLOWED after real billing expiry' : r.e!;
+        expect(r.ok).toBe(false);
+        expect(r.e).toMatch(/organization seat entitlement has expired/);
+      };
+
+      // (a) runtime: a new pending invitation reserves a seat.
+      const inv = await s.seed(ACME, 'acme', 'inv@acme.test', 'contractor', 'invited');
+      expectExpired('runtime invitation', await straddle('runtime', c => c.query(`INSERT INTO workspace_invitations (organization_id, workspace_id, member_id, email, role, status, invited_by_member_id, created_at, expires_at)
+        VALUES ($1, 'acme', $2, 'inv@acme.test', 'contractor', 'pending', $3, now(), now() + interval '1 day')`, [ACME, inv.id, a.id])));
+
+      // (b) application acceptance: the transaction opens (member locked) before billing expiry and stalls; the activation
+      // that follows consumes a seat after it.
+      await billingIn(60);
+      const pending = await invitation(s, a.id, 'accept@acme.test');
+      await billingIn(2);
+      const p = party(s, 'hv-s14-accept', ctx(ACME, 'acme'), /^UPDATE workspace_invitations SET status = 'accepted'/);
+      try {
+        const accepting = settle(p.store.acceptInvitation(pending.id, new Date()));
+        await p.atGate;
+        await sleep(3000);
+        p.release();
+        expectExpired('application activation', await accepting as { ok: boolean; e?: string });
+      } finally { p.release(); await p.pool.end(); }
+      expect((await s.mon.query(`SELECT status FROM workspace_members WHERE id = $1`, [pending.id])).rows[0].status).toBe('invited');
+
+      // (c) operator reactivation of a suspended member.
+      const sus = await s.seed(ACME, 'acme', 'sus@acme.test', 'contractor');
+      await s.op.query(`UPDATE workspace_members SET status = 'suspended' WHERE id = $1`, [sus.id]);
+      expectExpired('operator reactivation', await straddle('operator', c => c.query(`UPDATE workspace_members SET status = 'active' WHERE id = $1`, [sus.id])));
+
+      // (d) operator insert of an active member.
+      expectExpired('operator active insert', await straddle('operator', c => c.query(`INSERT INTO workspace_members (organization_id, workspace_id, auth_user_id, email, display_name, role, status, activated_at)
+        VALUES ($1, 'acme', $2, 'late@acme.test', 'r', 'contractor', 'active', now())`, [ACME, randomUUID()])));
+      log('S14', JSON.stringify(results));
+
+      // (e) control: the same long transaction still consumes a seat while billing is valid by the real clock.
+      const ok = await straddle('runtime', c => c.query(`INSERT INTO workspace_invitations (organization_id, workspace_id, member_id, email, role, status, invited_by_member_id, created_at, expires_at)
+        VALUES ($1, 'acme', $2, 'inv@acme.test', 'contractor', 'pending', $3, now(), now() + interval '1 day')`, [ACME, inv.id, a.id]), 0);
+      expect(ok.ok).toBe(true);
+    });
+  }, 180_000);
 });

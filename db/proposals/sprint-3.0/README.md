@@ -104,7 +104,7 @@ Promotion therefore needs an **explicit, owner-approved release window**: a name
 
 ## Final proposal digest (Sprint 3.0.5)
 
-`20261106120000_multi-organization-memberships.sql` SHA-256: **`dc5640f445eba246eed207f18f412bc7f07c80d0066c3bdfba722ace40ba1850`** (Sprint 3.0.5; supersedes `3c54e08d…8cfb` from Sprint 3.0.3). It is pinned in `server/auth/m8-invitation-and-lock-pins.test.ts`, so any edit fails the offline suite. The Netlify preview rehearsal ([runbook](../../../docs/m8-preview-rehearsal-runbook.md)) must use exactly this digest. Any edit to the file invalidates the review and any rehearsal evidence.
+`20261106120000_multi-organization-memberships.sql` SHA-256: **`beaddd6a0c0198eefbd7c5b7f5b6f02d6c358cd8c646681fba764e4d6f6bbdc1`** (Sprint 3.0.5; supersedes `3c54e08d…8cfb` from Sprint 3.0.3). It is pinned in `server/auth/m8-invitation-and-lock-pins.test.ts`, so any edit fails the offline suite. The Netlify preview rehearsal ([runbook](../../../docs/m8-preview-rehearsal-runbook.md)) must use exactly this digest. Any edit to the file invalidates the review and any rehearsal evidence.
 
 ## Rollback limitations
 

@@ -323,7 +323,7 @@ BEGIN
       RAISE EXCEPTION 'organization has no seat entitlement';
     END IF;
     IF ent.plan <> 'internal_unlimited' THEN
-      IF ent.billing_expires_at IS NOT NULL AND ent.billing_expires_at <= now() THEN
+      IF ent.billing_expires_at IS NOT NULL AND ent.billing_expires_at <= clock_timestamp() THEN
         RAISE EXCEPTION 'organization seat entitlement has expired';
       END IF;
       SELECT (SELECT count(*) FROM workspace_members m WHERE m.organization_id = NEW.organization_id AND m.status = 'active' AND m.id <> NEW.id)
@@ -365,7 +365,7 @@ BEGIN
       RAISE EXCEPTION 'organization has no seat entitlement';
     END IF;
     IF ent.plan <> 'internal_unlimited' THEN
-      IF ent.billing_expires_at IS NOT NULL AND ent.billing_expires_at <= now() THEN
+      IF ent.billing_expires_at IS NOT NULL AND ent.billing_expires_at <= clock_timestamp() THEN
         RAISE EXCEPTION 'organization seat entitlement has expired';
       END IF;
       SELECT (SELECT count(*) FROM workspace_members m WHERE m.organization_id = NEW.organization_id AND m.status = 'active')
@@ -425,7 +425,7 @@ BEGIN
       RAISE EXCEPTION 'organization has no seat entitlement';
     END IF;
     IF ent.plan <> 'internal_unlimited' THEN
-      IF ent.billing_expires_at IS NOT NULL AND ent.billing_expires_at <= now() THEN
+      IF ent.billing_expires_at IS NOT NULL AND ent.billing_expires_at <= clock_timestamp() THEN
         RAISE EXCEPTION 'organization seat entitlement has expired';
       END IF;
       ref := least(now(), NEW.created_at);

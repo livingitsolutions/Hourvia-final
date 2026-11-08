@@ -29,7 +29,7 @@ const ctx = (org: OrganizationId, slug: string): OrganizationContext =>
 const one = async <T = Record<string, unknown>>(h: Harness, text: string, params?: unknown[]) => (await h.pg.query<T>(text, params)).rows[0]!;
 const SELF_CHECK_START = M8_PROPOSAL_SQL.indexOf('-- 9. Self-check');
 /** Final Sprint 3.0.5 proposal digest. The Netlify preview rehearsal must run exactly this file. */
-const M8_PROPOSAL_DIGEST = 'dc5640f445eba246eed207f18f412bc7f07c80d0066c3bdfba722ace40ba1850';
+const M8_PROPOSAL_DIGEST = 'beaddd6a0c0198eefbd7c5b7f5b6f02d6c358cd8c646681fba764e4d6f6bbdc1';
 
 /** An M8 database with ACME (seats), an active ACME Administrator, and an invited, linked contractor with a pending invitation. */
 async function acme(seats = 5, invitation: { createdAgoMs?: number; expiresInMs?: number } = {}) {
