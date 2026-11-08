@@ -590,7 +590,8 @@ CREATE TRIGGER auth_sessions_guard_insert BEFORE INSERT ON auth_sessions
 --     member guard has already required that member's authority over the subject, and the session guard re-checks it
 --     (audit authority 'workspace_admin' or 'platform_super_admin'). Operator SQL with no disabled_by is 'operator';
 --   * leaving 'disabled' or 'suspended' (operator reinstatement or unsuspension; the runtime can do neither): any session
---     still unrevoked, which only a pre-M8 non-atomic disable can have left behind, is revoked with reason
+--     still unrevoked (left on M7 by a pre-3.0.2 or operator disable, or by a login racing a disable, which M7's
+--     missing insert guard allows) is revoked with reason
 --     'member_reinstated' and authority 'operator', before the member can act again.
 -- The exclusive per-organization session lock is the same one suspension takes, so a session committed concurrently
 -- with a disable is either refused by the insert guard (disable first) or revoked here (session first).
@@ -770,14 +771,52 @@ BEGIN
     RAISE EXCEPTION 'self-check failed: guard or audit triggers are missing or disabled';
   END IF;
   -- Sprint 3.0.2 (G1): the member revocation trigger fires on transitions into and out of both 'suspended' and 'disabled'.
-  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'workspace_members_status_session_revocation' AND tgrelid = 'public.workspace_members'::regclass
-                 AND pg_get_triggerdef(oid) LIKE '%''suspended''%' AND pg_get_triggerdef(oid) LIKE '%''disabled''%'
-                 AND pg_get_triggerdef(oid) LIKE '%old.status%') THEN
+  -- Sprint 3.0.3: pinned completely. Exactly one such trigger: AFTER UPDATE OF status only, FOR EACH ROW (tgtype 17),
+  -- enabled, calling hourvia_revoke_member_sessions(), with the exact WHEN clause (PostgreSQL 18 deparse; the function
+  -- name is compared without the schema qualifier that pg_get_triggerdef adds when public is not on the search_path). That covers
+  -- every changing transition into suspended or disabled and every transition out of them, and nothing else. The function
+  -- body must map each target to its reason and attribution, take the EXCLUSIVE per-organization session lock and revoke
+  -- only still-unrevoked sessions of that member in that organization.
+  IF (SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal AND tgrelid = 'public.workspace_members'::regclass
+        AND tgfoid = 'public.hourvia_revoke_member_sessions()'::regprocedure) <> 1
+     OR NOT EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgname = 'workspace_members_status_session_revocation' AND t.tgrelid = 'public.workspace_members'::regclass
+       AND NOT t.tgisinternal AND t.tgenabled = 'O' AND t.tgtype = 17
+       AND t.tgfoid = 'public.hourvia_revoke_member_sessions()'::regprocedure
+       AND t.tgattr::text = (SELECT a.attnum::text FROM pg_attribute a WHERE a.attrelid = 'public.workspace_members'::regclass AND a.attname = 'status')
+       AND replace(pg_get_triggerdef(t.oid), 'EXECUTE FUNCTION public.hourvia_', 'EXECUTE FUNCTION hourvia_') = 'CREATE TRIGGER workspace_members_status_session_revocation AFTER UPDATE OF status ON public.workspace_members FOR EACH ROW WHEN (((old.status IS DISTINCT FROM new.status) AND ((new.status = ANY (ARRAY[''suspended''::text, ''disabled''::text])) OR (old.status = ANY (ARRAY[''suspended''::text, ''disabled''::text]))))) EXECUTE FUNCTION hourvia_revoke_member_sessions()') THEN
     RAISE EXCEPTION 'self-check failed: member session revocation does not cover suspension and disable';
   END IF;
+  DECLARE
+    body text := pg_get_functiondef('public.hourvia_revoke_member_sessions()'::regprocedure);
+  BEGIN
+    IF body NOT LIKE '%IF current_setting(''transaction_isolation'') <> ''read committed'' THEN%'
+       OR body NOT LIKE '%IF NEW.status = ''suspended'' THEN%reason := ''member_suspended'';%ELSIF NEW.status = ''disabled'' THEN%reason := ''member_disabled'';%actor := NEW.disabled_by;%ELSE%reason := ''member_reinstated'';%END IF;%'
+       OR body NOT LIKE '%PERFORM pg_advisory_xact_lock(hashtextextended(''hourvia_sessions:'' || NEW.organization_id::text, 0));%'
+       OR body LIKE '%pg_advisory_xact_lock_shared%' OR body LIKE '%pg_try_advisory%'
+       OR body NOT LIKE '%UPDATE auth_sessions SET revoked_at = now(), revoked_reason = reason, revoked_by_member_id = actor%WHERE member_id = NEW.id AND organization_id = NEW.organization_id AND revoked_at IS NULL;%' THEN
+      RAISE EXCEPTION 'self-check failed: hourvia_revoke_member_sessions does not revoke every transition with its reason, attribution and exclusive lock';
+    END IF;
+  END;
   -- Sprint 3.0.2 (G2): the session lifetime cap is anchored to the database clock.
-  IF pg_get_functiondef('public.hourvia_guard_session_insert()'::regprocedure) NOT LIKE '%NEW.created_at > clock_timestamp()%' THEN
-    RAISE EXCEPTION 'self-check failed: hourvia_guard_session_insert does not bound created_at by the database clock';
+  -- Sprint 3.0.3: both bounds are pinned (created_at at most 2 minutes ahead of the database clock, and the absolute
+  -- expiry at most database time + 24 h 2 min), as are the relative 24-hour cap, the BEFORE INSERT row trigger
+  -- (tgtype 7) that enforces them, and the update guard that keeps both timestamps immutable after insert.
+  DECLARE
+    body text := pg_get_functiondef('public.hourvia_guard_session_insert()'::regprocedure);
+  BEGIN
+    IF body NOT LIKE '%IF NEW.absolute_expires_at > NEW.created_at + interval ''24 hours'' THEN%RAISE EXCEPTION%'
+       OR body NOT LIKE '%IF NEW.created_at > clock_timestamp() + interval ''2 minutes'' THEN%RAISE EXCEPTION ''session created_at is in the future'';%'
+       OR body NOT LIKE '%IF NEW.absolute_expires_at > clock_timestamp() + interval ''24 hours 2 minutes'' THEN%RAISE EXCEPTION ''session absolute lifetime exceeds 24 hours of database time'';%' THEN
+      RAISE EXCEPTION 'self-check failed: hourvia_guard_session_insert does not bound created_at by the database clock';
+    END IF;
+  END;
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgname = 'auth_sessions_guard_insert' AND t.tgrelid = 'public.auth_sessions'::regclass
+                 AND NOT t.tgisinternal AND t.tgenabled = 'O' AND t.tgtype = 7 AND t.tgfoid = 'public.hourvia_guard_session_insert()'::regprocedure)
+     OR NOT EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgname = 'auth_sessions_guard' AND t.tgrelid = 'public.auth_sessions'::regclass
+                 AND NOT t.tgisinternal AND t.tgenabled = 'O' AND t.tgtype = 19 AND t.tgfoid = 'public.hourvia_guard_session_update()'::regprocedure)
+     OR pg_get_functiondef('public.hourvia_guard_session_update()'::regprocedure)
+          NOT LIKE '%NEW.created_at IS DISTINCT FROM OLD.created_at OR NEW.absolute_expires_at IS DISTINCT FROM OLD.absolute_expires_at THEN%' THEN
+    RAISE EXCEPTION 'self-check failed: the session timestamp bounds are not enforced on insert or not immutable on update';
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'workspace_members_runtime_invitation' AND tgconstraint <> 0 AND tgdeferrable AND tginitdeferred
                  AND tgrelid = 'public.workspace_members'::regclass) THEN

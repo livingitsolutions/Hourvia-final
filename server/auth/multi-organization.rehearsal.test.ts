@@ -521,8 +521,9 @@ describe.skipIf(!enabled)('Sprint 3.0.1 M8 concurrency rehearsal on a disposable
       const old1 = await s.session(s.acme, d.am.id), old2 = await s.session(s.acme, d.am.id);
       const metaTs = await s.session(s.ts, d.t.id);
 
-      // (a) a switch into ACME holds the shared lock with its replacement uncommitted; the Administrator's disable revokes
-      // the two committed sessions, waits for the lock in the status trigger, then also revokes the replacement.
+      // (a) a switch into ACME holds the shared lock with its replacement uncommitted; the Administrator's disable locks the
+      // member, changes its status, waits for the lock in the status trigger, then revokes the two committed sessions AND
+      // the replacement. Sprint 3.0.3: the count includes trigger revocations, so it is 3 (Sprint 3.0.2 reported 2).
       const sw = gatedSwitch(s, /^INSERT INTO auth_audit_events/);
       const dis = party(s, 'hv-s11-disable', ACME_CTX());
       let replacement: { ip: string; sessionToken: string };
@@ -535,7 +536,7 @@ describe.skipIf(!enabled)('Sprint 3.0.1 M8 concurrency rehearsal on a disposable
         const [r, x] = await Promise.all([switching, disabling]);
         log('S11a', JSON.stringify({ switch: r.status, disable: x }));
         expect(r.status).toBe(200);
-        expect(x).toEqual({ ok: true, v: { changed: true, sessionsRevoked: 2 } });
+        expect(x).toEqual({ ok: true, v: { changed: true, sessionsRevoked: 3 } });
         replacement = tokenOf(r);
       } finally { sw.release(); dis.release(); await dis.pool.end(); }
       expect(await revocations(s, d.am.id)).toEqual([
