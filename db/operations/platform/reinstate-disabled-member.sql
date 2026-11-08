@@ -1,8 +1,11 @@
 -- OPERATOR PROCEDURE — NOT A MIGRATION. Reinstates a member who was disabled in error (AP-MEMBER-REINSTATE).
 -- Restores status 'active' with the SAME role and identity. It does not restore ended sessions, does not change the
 -- role and does not grant any platform privilege. Sprint 3.0.2 (G1): any session of the member that is still unrevoked
--- (only a disable from before Sprint 3.0.2 could have left one behind) is revoked FIRST, in the same transaction, so
--- reinstatement can never revive an old session; the member signs in again. Before running it, unban the Supabase user (Authentication ->
+-- is revoked FIRST, in the same transaction, so reinstatement can never revive an old session; the member signs in again.
+-- Sprint 3.0.3: on M7 such a session can exist even after an atomic application disable (a login that read the member
+-- as active just before the disable committed inserts its session afterwards; M7 has no session insert guard), as well
+-- as after a pre-3.0.2 or operator disable. This procedure is therefore MANDATORY for every reinstatement; never
+-- re-enable a member with a raw UPDATE. Before running it, unban the Supabase user (Authentication ->
 -- Users) under the same approval; Hourvia banned it when the member was disabled.
 -- Replace exactly two quoted placeholders: '<EXPECTED_MEMBER_ID>' and '<APPROVAL_REF>'.
 DO $reinstate$

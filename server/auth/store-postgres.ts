@@ -184,30 +184,43 @@ export class PostgresAuthStore implements AuthStore {
   /**
    * Sprint 3.0.2 (G1): disabling a member and ending its sessions are ONE transaction. Before, they were two, so a
    * failure between them left a disabled member with live session rows, which an operator reinstatement would bring
-   * back into force. Order (Sprint 1.9C.1 lock order: the member row first):
-   *   1. lock the member row FOR NO KEY UPDATE (the lock the status UPDATE takes anyway);
-   *   2. revoke every unrevoked session, attributed to the disabling administrator, even if the member is already
-   *      disabled, so leftovers from an earlier non-atomic disable are swept too;
-   *   3. disable the member (on an M8 database its trigger also revokes, under the exclusive per-organization session
-   *      lock, any session committed concurrently since step 2);
-   *   4. revoke pending invitations.
-   * Any failure rolls back all four, leaving the member and its sessions exactly as they were.
+   * back into force.
+   *
+   * Sprint 3.0.3 lock order. The database-wide order for session revocation is: member row, then the per-organization
+   * 'hourvia_sessions:<org>' advisory lock (M8), then session rows. Organization suspension takes the advisory lock and
+   * then the session rows. Sprint 3.0.2 swept the session rows BEFORE the member UPDATE, whose M8 trigger then waited
+   * for the advisory lock. Suspension, holding that lock and waiting for the same session rows, deadlocked with it.
+   * The order is now:
+   *   1. lock the member row FOR NO KEY UPDATE (the lock the status UPDATE takes anyway). If the member is already
+   *      disabled, sweep any leftover unrevoked session (from a pre-3.0.2 disable or an M7 login race) and stop;
+   *   2. disable the member. On M8 its trigger takes the exclusive session lock and revokes every unrevoked session,
+   *      including one committed concurrently, attributed to disabled_by;
+   *   3. count the sessions that trigger revoked in this transaction (revoked_at = now(), the trigger's timestamp);
+   *   4. explicitly sweep anything still unrevoked. On M7, which has no trigger, this does all the work. On M8 it finds
+   *      nothing, because the exclusive lock is held until COMMIT and the insert guard refuses sessions for a disabled member;
+   *   5. revoke pending invitations.
+   * Any failure rolls back everything, leaving the member, its sessions and its invitations exactly as they were.
    */
   disableMemberAndRevokeSessions(memberId: string, disabledBy: string, now: Date): Promise<{ changed: boolean; sessionsRevoked: number }> {
     return this.sql.transaction(async tx => {
       const locked = await tx.query<{ id: string; status: string }>(
         `SELECT id, status FROM workspace_members WHERE workspace_id = $1 AND organization_id = $3 AND id = $2 AND id <> $4 FOR NO KEY UPDATE`, [this.ws, memberId, this.org, disabledBy]);
       if (locked.rows.length !== 1) return { changed: false, sessionsRevoked: 0 };
-      const revoked = await tx.query(
+      const sweep = () => tx.query(
         `UPDATE auth_sessions SET revoked_at = $2, revoked_reason = 'member_disabled', revoked_by_member_id = $3
          WHERE member_id = $1 AND organization_id = $4 AND revoked_at IS NULL RETURNING id`, [memberId, now, disabledBy, this.org]);
-      if (locked.rows[0]!.status === 'disabled') return { changed: false, sessionsRevoked: revoked.rows.length };
+      if (locked.rows[0]!.status === 'disabled') return { changed: false, sessionsRevoked: (await sweep()).rows.length };
       const { rows } = await tx.query(
         `UPDATE workspace_members SET status = 'disabled', disabled_at = $3, disabled_by = $4
          WHERE workspace_id = $1 AND organization_id = $5 AND id = $2 AND status <> 'disabled' AND id <> $4 RETURNING id`, [this.ws, memberId, now, disabledBy, this.org]);
       if (rows.length !== 1) throw new Error('member_not_disableable');
+      // Read before the sweep, so a sweep row can never be counted twice, even if the application clock equals now().
+      const byTrigger = await tx.query<{ n: number }>(
+        `SELECT count(*)::int AS n FROM auth_sessions WHERE member_id = $1 AND organization_id = $3 AND revoked_reason = 'member_disabled'
+           AND revoked_by_member_id = $2 AND revoked_at = now()`, [memberId, disabledBy, this.org]);
+      const swept = await sweep();
       await tx.query(`UPDATE workspace_invitations SET status = 'revoked' WHERE workspace_id = $1 AND organization_id = $3 AND member_id = $2 AND status = 'pending'`, [this.ws, memberId, this.org]);
-      return { changed: true, sessionsRevoked: revoked.rows.length };
+      return { changed: true, sessionsRevoked: Number(byTrigger.rows[0]?.n ?? 0) + swept.rows.length };
     });
   }
 

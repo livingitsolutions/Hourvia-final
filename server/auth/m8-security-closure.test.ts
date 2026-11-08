@@ -81,6 +81,31 @@ describe('G1: disabling a member is atomic with session revocation (application 
     });
   }
 
+  for (const variant of ['M7', 'M8'] as const) {
+    it(`${variant}: Sprint 3.0.3 lock order: member row lock, member UPDATE, then the explicit session sweep`, async () => {
+      // Sweeping session rows before the member UPDATE deadlocked with organization suspension on M8 (the member trigger
+      // waited for the per-organization lock while suspension, holding it, waited for those session rows). The
+      // disposable-PostgreSQL proof is scripts/rehearsal/disable-lock-order-rehearsal.sh; this pins the statement order.
+      const h = await createHarness({ now: new Date(), multiOrganization: variant === 'M8' });
+      const { admin, c } = await signedIn(h);
+      const seen: string[] = [];
+      const recording = (inner: SqlClient): SqlClient => ({
+        query: (text, params) => { seen.push(text.trim().replace(/\s+/g, ' ').slice(0, 40)); return inner.query(text, params); },
+        transaction: fn => inner.transaction(tx => fn(recording(tx))),
+      });
+      const store = new PostgresAuthStore(recording(statementGuardedSqlClient(h.sql)));
+      expect(await store.disableMemberAndRevokeSessions(c.id, admin.id, new Date(h.clock.now))).toEqual({ changed: true, sessionsRevoked: 2 });
+      const at = (p: RegExp) => seen.findIndex(s => p.test(s));
+      expect(at(/^SELECT id, status FROM workspace_members/)).toBe(0);
+      expect(at(/^UPDATE workspace_members SET status/)).toBeGreaterThan(0);
+      expect(at(/^UPDATE auth_sessions/)).toBeGreaterThan(at(/^UPDATE workspace_members SET status/));
+      expect(at(/^UPDATE workspace_invitations/)).toBeGreaterThan(at(/^UPDATE auth_sessions/));
+      expect(seen.filter(s => /^UPDATE auth_sessions/.test(s))).toHaveLength(1);
+      expect(await sessionsOf(h, c.id)).toEqual([
+        { reason: 'member_disabled', by: admin.id, revoked: true }, { reason: 'member_disabled', by: admin.id, revoked: true }]);
+    });
+  }
+
   it('M7: a stale session left by an operator (non-application) disable is swept by the reinstatement procedure', async () => {
     const h = await createHarness({ now: new Date() });
     const { c, cookies } = await signedIn(h);
@@ -221,5 +246,45 @@ describe('G2: the absolute session lifetime is capped against the database clock
     expect(M8_PROPOSAL_SQL).toMatch(/IF NEW\.created_at > clock_timestamp\(\) \+ interval '2 minutes' THEN\s+RAISE EXCEPTION 'session created_at is in the future'/);
     expect(M8_PROPOSAL_SQL).toMatch(/IF NEW\.absolute_expires_at > clock_timestamp\(\) \+ interval '24 hours 2 minutes' THEN/);
     expect(M8_PROPOSAL_SQL).toMatch(/self-check failed: hourvia_guard_session_insert does not bound created_at by the database clock/);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Sprint 3.0.3: the G1/G2 self-checks pin the complete behaviour. Each mutation weakens exactly one property of the M8
+// text (first occurrence only, which is always the definition, not the self-check pattern); applying it to an M7
+// database must abort in the self-check, so the whole migration rolls back.
+describe('Sprint 3.0.3: M8 self-checks reject any weakened G1/G2 definition', () => {
+  const G1 = /self-check failed: (member session revocation does not cover suspension and disable|hourvia_revoke_member_sessions does not revoke)/;
+  const G2 = /self-check failed: (hourvia_guard_session_insert does not bound created_at by the database clock|the session timestamp bounds are not enforced)/;
+  const mutations: [string, string, string, RegExp][] = [
+    ['G1: transitions out of suspended/disabled not covered', `OR OLD.status IN ('suspended', 'disabled')`, `OR OLD.status IN ('suspended')`, G1],
+    ['G1: transition into disabled not covered', `AND (NEW.status IN ('suspended', 'disabled') OR`, `AND (NEW.status IN ('suspended') OR`, G1],
+    ['G1: trigger fires on any column update', `AFTER UPDATE OF status ON workspace_members\n  FOR EACH ROW WHEN`, `AFTER UPDATE ON workspace_members\n  FOR EACH ROW WHEN`, G1],
+    ['G1: disable attribution dropped', `actor := NEW.disabled_by;`, `actor := NULL;`, G1],
+    ['G1: reinstatement sweep reason changed', `reason := 'member_reinstated';`, `reason := 'member_suspended';`, G1],
+    ['G1: shared instead of exclusive session lock',
+      `PERFORM pg_advisory_xact_lock(hashtextextended('hourvia_sessions:' || NEW.organization_id::text, 0));\n  UPDATE auth_sessions SET revoked_at = now(), revoked_reason = reason`,
+      `PERFORM pg_advisory_xact_lock_shared(hashtextextended('hourvia_sessions:' || NEW.organization_id::text, 0));\n  UPDATE auth_sessions SET revoked_at = now(), revoked_reason = reason`, G1],
+    ['G2: created_at upper bound loosened', `IF NEW.created_at > clock_timestamp() + interval '2 minutes' THEN`, `IF NEW.created_at > clock_timestamp() + interval '2 days' THEN`, G2],
+    ['G2: absolute expiry bound loosened', `clock_timestamp() + interval '24 hours 2 minutes' THEN`, `clock_timestamp() + interval '48 hours' THEN`, G2],
+    ['G2: relative 24-hour cap loosened', `NEW.created_at + interval '24 hours' THEN`, `NEW.created_at + interval '48 hours' THEN`, G2],
+    ['G2: timestamps mutable after insert',
+      `OR NEW.created_at IS DISTINCT FROM OLD.created_at OR NEW.absolute_expires_at IS DISTINCT FROM OLD.absolute_expires_at THEN`, ` THEN`, G2],
+  ];
+  for (const [name, from, to, error] of mutations) {
+    it(name, async () => {
+      expect(M8_PROPOSAL_SQL).toContain(from);
+      const mutated = M8_PROPOSAL_SQL.replace(from, to);
+      expect(mutated).not.toBe(M8_PROPOSAL_SQL);
+      const h = await createHarness({ now: new Date() }); // M1-M7
+      await expect(applyMigration(h.pg, mutated)).rejects.toThrow(error);
+      expect((await rows<{ n: number }>(h, `SELECT count(*)::int n FROM pg_proc WHERE proname = 'hourvia_revoke_member_sessions'`))[0]!.n).toBe(0); // rolled back
+    });
+  }
+
+  it('the unmodified proposal passes the strengthened self-checks', async () => {
+    const h = await createHarness({ now: new Date() });
+    await applyMigration(h.pg, M8_PROPOSAL_SQL);
+    expect((await rows<{ n: number }>(h, `SELECT count(*)::int n FROM pg_trigger WHERE tgname = 'workspace_members_status_session_revocation'`))[0]!.n).toBe(1);
   });
 });
