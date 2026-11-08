@@ -1,6 +1,6 @@
 # Hourvia operations status
 
-Last reconciled: Sprint 3.0.2, 2026-11-07. This document records what is known about the production deployment, database and configuration, and how each fact is known. It authorizes no operation. Update it whenever a status changes, and keep the evidence class accurate.
+Last reconciled: Sprint 3.0.5, 2026-11-08. This document records what is known about the production deployment, database and configuration, and how each fact is known. It authorizes no operation. Update it whenever a status changes, and keep the evidence class accurate.
 
 ## Evidence classes
 
@@ -22,7 +22,8 @@ Last reconciled: Sprint 3.0.2, 2026-11-07. This document records what is known a
 | Published deploy | `6aebf26c137be0d868ccff2e`, commit `3fd11656743b799b8527dead246468e4cda20203` (PR #19, Sprint 3.0), context `production`, database branch `production`, published 2026-11-05 03:05:42 UTC, locked (re-verified 2026-11-07 from live site metadata, Sprint 3.0.2) |
 | Previous published deploy | `6aebe50abd9ac16c02942a31`, commit `6c22106d4e97eff0860c77b9f14b468e25209f67` (Historical) |
 | GitHub `main` protection | Ruleset `26699501` "Hourvia - Protect Main Production", enforcement `active`, target default branch: pull request with 1 approval (last-push approval, stale reviews dismissed, threads resolved), no deletion, no force push (verified 2026-11-06 through the public API). Bypass actors: **Unverified** (visible to admins only) |
-| Known-good rollback deploy | `6aeb5cd4c8797713f23cc5b8` (same commit) |
+| Known-good rollback deploy | `6aeb5cd4c8797713f23cc5b8` (same commit). Valid **only while the production database is M1–M7**. After M8 it is not a rollback target (see release rules) |
+| Post-M8 recovery target | **Not designated.** Must be designated by the owner before any M8 release window (see release rules) |
 | Authentication | Fail-closed. `/api/auth/session`, `/api/admin/members` and `/api/platform/overview` return 503 `auth_unavailable` (re-verified 2026-11-06) |
 | Multi-organization | Not available. No HTTP route; no runtime capability; M8 is a proposal outside the migrations directory (re-verified 2026-11-07: `netlify/database/migrations/` holds exactly M1–M7, digests below unchanged) |
 | Deploy secret scan | 94 files scanned, 0 matches |
@@ -46,7 +47,9 @@ These digests are pinned in `server/auth/production-database.ts` (`MIGRATION_DIG
 - **Verified (deploy metadata):** production deploys recorded applying M1–M2 (`6aea1369`, 11-03 17:01 UTC), M3–M4 (`6aea8aec`, 11-04 01:31 UTC) and M5–M6 (`6aeaa310`, 11-04 03:14 UTC). Production deploys since 15:24 UTC on 11-04 report no pending migrations and no errors.
 - **Owner-confirmed:** the current production deploy completed database provisioning and discovered M1–M7.
 - **Historical finding (provenance discrepancy):** the production ledger contained M7 before 15:20:40 UTC on 11-04. At that time the production deploy `6aeabf28` (commit `799f042`, no M7) was re-published three times (15:20:40, 15:20:54, 15:23:14 UTC) and recorded "migration 20261104170000_organizations-expand has been removed after being applied". No deploy on any Hourvia site records applying M7 to production, and M7 reached `main` only at 15:24:43 UTC (PR #15). What wrote M7 to the production ledger is **unverified**.
-- **Access limitation:** `netlify db status --branch production`, the database metadata API, build logs and the account audit log return 401 from Agent Runner.
+- **Verified (full deploy history, Sprint 3.0.4 audit, 2026-11-08):** M1–M6 were each applied by an identifiable production deploy. **No production deploy on this site has ever recorded applying M7.** M7 was applied only to preview branches (from 13:37 UTC on 11-04), and the production ledger already contained it when `6aeabf28` was re-published at 15:20:40 UTC. The out-of-band write therefore happened between about 13:37 and 15:20:40 UTC on 2026-11-04 (inferred window). Every later production build, including the locked, unpublished builds for PR #20–#22, reports no pending migrations.
+- **Verified (secondary, Sprint 3.0.4):** a preview branch copied from production (it holds production rows) shows exactly M1–M7 applied, and its catalog matches a replay of the repository's M1–M7 on 325 of 327 fingerprint items; the two differences are platform artefacts (`cloud_admin` default ACLs, grantor name). This is evidence against schema drift, **not** production evidence.
+- **Access limitation:** `netlify db status --branch production`, the database metadata API, build logs and the account audit log return 401 from Agent Runner. The platform ledger tables `netlify.migrations` and `netlify.migration_checksums` (which holds a per-migration `sha256`) are not readable by `netlifydb_readonly`.
 - **Unverified:** the production ledger's exact contents and order, whether production's M7 content matches the repository digest, and the production catalog (tables, constraints, grants, functions, search paths, organization schema).
 
 ## Configuration
@@ -67,11 +70,16 @@ The code refuses authentication outside a published production deploy on this si
 
 ## Release rules
 
-- Every merge to `main` builds a production deploy and may apply any new migration file to the production database. While production publishing is locked, the new deploy is not published until the owner publishes it. Whether a locked, unpublished production build still applies migrations is **Unverified**, so no migration may reach `main` without the steps below.
+- **Merging a migration file into `main` applies it to the production database, even while publishing is locked.** The lock gates only which deploy is served. Every production build still runs the migration step against database branch `production`: the locked, unpublished builds `6aee7c60` (PR #20), `6aefca2c` (PR #21) and `6aefd8e1` (PR #22) each carry a `database_migrations` result for `production` (verified from deploy metadata, Sprint 3.0.4). Treat the merge itself as the production database change.
+- **M8 promotion needs an explicit owner-approved release window:** a named owner present, a written time window, every M8 evidence gate below closed beforehand, the post-M8 recovery target plan agreed, and nothing else in the same merge. No agent may merge a migration PR.
+- **Existing pre-M8 deploys are not valid post-M8 rollback targets.** Once M8 is applied, republishing any deploy built without M8 (including the published `6aebf26c` and the known-good `6aeb5cd4`) produces a migration-history error, as happened with M7 on 2026-11-04. Before the window the owner designates a **post-M8 compatible recovery target**: the deploy built from the promotion merge commit once it is `ready`. Record its ID in the table above. Until then the only recovery is a reviewed forward fix, with authentication staying at 503.
+- **Operator SQL on organizations suspends, closes or reactivates one organization per transaction.** Taking two organizations' session locks in one transaction can deadlock with an in-flight organization switch.
+- **PostgreSQL deadlock (`40P01`) or serialization (`40001`) errors mean the whole transaction was rolled back.** Re-read the state, confirm nothing changed, retry once, then verify the intended end state (status and session revocation) with a read-only query before reporting success. Never retry blindly in a loop, and never work around the error by changing isolation level (M8 refuses anything other than READ COMMITTED).
 - Agent PRs (opened by `netlify-coding[bot]`) need an approving review under the `main` ruleset. Do not merge an agent PR before its independent review.
 - Do not republish any deploy built before commit `e33fefc` (PR #15). Pre-M7 deploys conflict with the production ledger.
 - **Before any M8 or later migration reaches `main`:**
   1. `netlify db status --branch production --json`, run by the owner, shows exactly M1–M7 in order, with nothing pending, missing or out of order.
   2. M7's provenance in production is explained (audit log or Netlify Support), and its applied content is confirmed to match the digest above, or a reviewed read-only catalog check matches the M1–M7 schema.
-  3. The new migration has been rehearsed offline and on an isolated preview database branch, and its preconditions refuse to run on any unexpected state.
+  3. The new migration has been rehearsed offline and on an isolated preview database branch, and its preconditions refuse to run on any unexpected state. For M8, follow [the M8 preview rehearsal runbook](m8-preview-rehearsal-runbook.md) with the pinned final digest.
+  4. The owner-approved release window and post-M8 recovery target above are agreed in writing.
 - Authentication activation additionally requires everything in [production pre-launch safeguards](production-prelaunch.md).
