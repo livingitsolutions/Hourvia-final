@@ -10,7 +10,7 @@
   - RLS is off.
 - **The M7 production ledger provenance issue is not resolved.** The production ledger recorded M7 before it reached `main`, and no deploy records the write ([operations status](../../../docs/operations-status.md)). M8 must not be promoted until all three of these have happened:
   1. The owner has run `netlify db status --branch production --json` and confirmed exactly M1–M7, with nothing pending, missing or out of order.
-  2. The production catalog has been independently verified against M7, for example with `db/verification/sprint-2.0b-preview-readonly.sql`.
+  2. The production catalog has been independently verified against M7, for example with `db/verification/sprint-2.0b-preview-readonly.sql`. That script reads rows (M7-1, M7-3) and uses `information_schema` (M7-2), so it cannot pass as `netlifydb_readonly`. It needs a reviewed credential decision by the owner, or a catalog-only subset (see the runbook's gate G2).
   3. The M7 provenance finding has been closed or explicitly accepted by the owner.
 
 ## What M8 changes

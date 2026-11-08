@@ -116,7 +116,7 @@ Not enforced by the database (accepted, documented):
 
 **Preview validation** (on the PR's Deploy Preview database branch only)
 - [ ] **P4.** The deploy log shows both migrations applied. A failure here, including any `privilege check failed` or `refusing to continue` message from `002`, **fails the preview and is the expected safety behaviour**. Fix forward with a new file in the same PR. Never edit an applied file.
-- [ ] **P5.** Run V1–V7 below with `netlify db connect --query "…"` against **that preview branch**. They are read-only catalog queries, and V6 reads zero rows.
+- [ ] **P5.** Run V1–V7 below with `netlify db connect --query "…"` against **that preview branch**. They are read-only catalog queries, and V6 reads zero rows. (Sprint 3.0.6: `netlify db connect` never selects a branch by itself. It uses `NETLIFY_DB_URL` or a local, unmigrated database. Target a preview branch only as described in section 7 of the [M8 preview rehearsal runbook](m8-preview-rehearsal-runbook.md).)
 
 **Production**
 - [ ] **P6.** The database owner approves in writing, then the PR is merged. The production deploy applies both migrations before publishing, and a failure blocks publishing. Confirm the deploy is `ready`, then repeat V1–V7 against production (read-only).

@@ -6,8 +6,10 @@
 -- No member, invitation, session, audit or entitlement row is read, so it runs as netlifydb_readonly and returns no
 -- personal data.
 --
---   netlify database connect --json --query "$(cat db/verification/sprint-3.0.5-m8-preview-readonly.sql)"
---     (from a checkout whose default database target the runbook has confirmed to be the rehearsal branch)
+--   ro_sql "$RO_URL" "$(cat db/verification/sprint-3.0.5-m8-preview-readonly.sql)"
+--     (runbook section 7 helper, with a netlifydb_readonly credential minted for the named rehearsal branch and
+--     identity-checked by ro_url. Never run it through an unqualified `netlify database connect`: that command ignores
+--     the Git branch and NETLIFY_DB_BRANCH, and reaches NETLIFY_DB_URL or a local, unmigrated database instead.)
 --
 -- Expected after M8:            'M8-0 M7 state' is false, and M8-1 ... M8-8 are all true.
 -- Expected on M7, or after a rolled-back M8 (the atomic-rollback rehearsal): M8-0 is true, and M8-1 ... M8-8 are all false.
